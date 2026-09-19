@@ -2,6 +2,7 @@ import { FeederInterruption, SystemNotification, InterruptionStatus, Interruptio
 import { INITIAL_FEEDERS_LIST, INITIAL_CUSTOMER_CONTACTS } from '../data/mockData';
 import { FEEDERS_VERSION } from '../data/feedersList';
 import { HubRecord, HUB_RECORDS } from '../data/hubData';
+import { supabase, isSupabaseConfigured } from './supabase';
 
 export const DEFAULT_TEAM_LEADERS: TeamLeaderUser[] = [
   { id: 'admin-1', username: 'admin', password: '@Eeu1234', name: 'System Administrator', district: 'Admin', role: 'admin', createdAt: new Date().toISOString() },
@@ -10,10 +11,29 @@ export const DEFAULT_TEAM_LEADERS: TeamLeaderUser[] = [
   { id: 'tl-d', username: 'zz01641821', password: 'eeu1234', name: 'Zekarias Zenebe', district: 'Admin', role: 'admin', createdAt: new Date().toISOString() }
 ];
 
+// Detect if we are running in a purely static environment (e.g. GitHub Pages) where /api/* doesn't exist
+export const isStaticEnvironment = typeof window !== 'undefined' && (
+  window.location.hostname.includes('github.io') ||
+  window.location.hostname.includes('vercel.app') ||
+  window.location.hostname.includes('netlify.app') ||
+  window.location.protocol === 'file:'
+);
+
+let serverProxyAvailable: boolean = !isStaticEnvironment;
+
+async function safeSupa(action: () => PromiseLike<any>) {
+  if (!supabase) return null;
+  try {
+    const res = await action();
+    return res;
+  } catch {
+    return null;
+  }
+}
+
 // Helper to notify UI if an error occurred
 function notifyIfRlsError(table: string, error: any) {
   if (!error) return;
-  console.warn(`[Proxy API ${table} Error]:`, error);
   const msg = (error.message || '').toLowerCase();
   if (
     error.code === '42501' ||
@@ -50,8 +70,9 @@ export function setLocal<T>(key: string, data: T) {
   }
 }
 
-// Generic API caller with error handling
+// Generic API caller with auto-fallback to direct Supabase / local
 async function apiFetch<T>(endpoint: string, options?: RequestInit): Promise<T | null> {
+  if (!serverProxyAvailable) return null;
   try {
     const res = await fetch(endpoint, {
       ...options,
@@ -60,13 +81,18 @@ async function apiFetch<T>(endpoint: string, options?: RequestInit): Promise<T |
         ...(options?.headers || {})
       }
     });
+    if (res.status === 404) {
+      // Endpoint does not exist (static host like GitHub Pages) - disable proxy to stop 404 log spam
+      serverProxyAvailable = false;
+      return null;
+    }
     if (!res.ok) {
       const errBody = await res.json().catch(() => ({}));
       throw new Error(errBody.error || `Request failed with status ${res.status}`);
     }
     return (await res.json()) as T;
-  } catch (err) {
-    console.warn(`API call to ${endpoint} failed:`, err);
+  } catch {
+    // Network or proxy failure
     return null;
   }
 }
@@ -82,9 +108,11 @@ if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
 }
 
 // ==========================================
-// SHARED REALTIME SYNC ENGINE (SERVER SSE STREAM PROXY)
+// SHARED REALTIME SYNC ENGINE
 // ==========================================
 let sseSource: EventSource | null = null;
+let directSupabaseChannel: any = null;
+
 const syncListeners = {
   interruptions: new Set<() => void>(),
   notifications: new Set<() => void>(),
@@ -98,9 +126,30 @@ const syncListeners = {
 export function getSharedRealtimeChannel() {
   if (typeof window === 'undefined') return null;
 
-  if (!sseSource) {
+  // 1. If running on static host (e.g. GitHub Pages), subscribe directly to Supabase realtime
+  if (!serverProxyAvailable || isStaticEnvironment) {
+    if (!directSupabaseChannel && supabase) {
+      try {
+        directSupabaseChannel = supabase
+          .channel('eeu_public_changes')
+          .on('postgres_changes', { event: '*', schema: 'public' }, (payload: any) => {
+            const table = (payload.table || '').toLowerCase();
+            if (table.includes('interruption')) broadcastGlobalSync('interruptions');
+            else if (table.includes('notification')) broadcastGlobalSync('notifications');
+            else if (table.includes('leader_note') || table.includes('leadernote')) broadcastGlobalSync('teamLeaderNotes');
+            else if (table.includes('leader')) broadcastGlobalSync('teamLeaders');
+            else if (table.includes('preset') || table.includes('feeder')) broadcastGlobalSync('presetFeeders');
+            else if (table.includes('hub')) broadcastGlobalSync('hubRecords');
+            else if (table.includes('contact')) broadcastGlobalSync('customerContacts');
+          })
+          .subscribe();
+      } catch (err) {
+        console.warn('Direct Supabase Realtime subscription note:', err);
+      }
+    }
+  } else if (!sseSource) {
+    // 2. Full-stack mode: Connect to our own SSE stream
     try {
-      // Connect to our own full-stack server SSE stream
       sseSource = new EventSource('/api/sync/stream');
 
       sseSource.addEventListener('sync', (e: MessageEvent) => {
@@ -109,32 +158,29 @@ export function getSharedRealtimeChannel() {
           const topic = payload?.topic as keyof typeof syncListeners;
           if (topic && syncListeners[topic]) {
             syncListeners[topic].forEach(cb => {
-              try { cb(); } catch (err) { console.error('Sync listener error:', err); }
+              try { cb(); } catch {}
             });
           }
-        } catch (err) {
-          console.warn('SSE payload parse error:', err);
-        }
+        } catch {}
       });
 
-      sseSource.onerror = (err) => {
-        // SSE automatically attempts reconnection per browser standard
-        console.warn('SSE stream status update / reconnecting:', err);
+      sseSource.onerror = () => {
+        // SSE auto-reconnects
       };
-    } catch (err) {
-      console.warn('Could not establish Server-Sent Events stream:', err);
+    } catch {
+      serverProxyAvailable = false;
     }
+  }
 
-    if (localBroadcastChannel) {
-      localBroadcastChannel.onmessage = (event) => {
-        const topic = event.data?.topic as keyof typeof syncListeners;
-        if (topic && syncListeners[topic]) {
-          syncListeners[topic].forEach(cb => {
-            try { cb(); } catch {}
-          });
-        }
-      };
-    }
+  if (localBroadcastChannel) {
+    localBroadcastChannel.onmessage = (event) => {
+      const topic = event.data?.topic as keyof typeof syncListeners;
+      if (topic && syncListeners[topic]) {
+        syncListeners[topic].forEach(cb => {
+          try { cb(); } catch {}
+        });
+      }
+    };
   }
 
   return sseSource;
@@ -175,54 +221,102 @@ export async function seedInitialDataIfEmpty() {
     }
   }
 
-  // Pre-seed backend team leaders if needed
-  try {
-    const existing = await apiFetch<TeamLeaderUser[]>('/api/teamLeaders');
-    if (!existing || existing.length === 0) {
-      for (const tl of DEFAULT_TEAM_LEADERS) {
-        await apiFetch('/api/teamLeaders', {
-          method: 'POST',
-          body: JSON.stringify(tl)
-        });
+  if (serverProxyAvailable) {
+    try {
+      const existing = await apiFetch<TeamLeaderUser[]>('/api/teamLeaders');
+      if (!existing || existing.length === 0) {
+        for (const tl of DEFAULT_TEAM_LEADERS) {
+          await apiFetch('/api/teamLeaders', {
+            method: 'POST',
+            body: JSON.stringify(tl)
+          });
+        }
       }
-    }
-  } catch {
-    // Ignore initial seeding failures
-  }
-
-  const SEED_STORAGE_KEY = 'eeu-local-seeded-v7';
-  if (typeof window !== 'undefined' && localStorage.getItem(SEED_STORAGE_KEY)) {
-    return;
-  }
-
-  if (typeof window !== 'undefined') {
-    if (!localStorage.getItem('eeu-feeders-list-v4')) {
-      setLocal('eeu-feeders-list-v4', INITIAL_FEEDERS_LIST);
-    }
-    if (!localStorage.getItem('eeu-hub-records')) {
-      setLocal('eeu-hub-records', HUB_RECORDS);
-    }
-    if (!localStorage.getItem('eeu-customer-contacts')) {
-      setLocal('eeu-customer-contacts', INITIAL_CUSTOMER_CONTACTS);
-    }
-    localStorage.setItem(SEED_STORAGE_KEY, 'true');
+    } catch {}
   }
 }
 
+// Normalizers for Supabase records (handles both camelCase and snake_case)
+function normalizeInterruption(row: any): FeederInterruption {
+  return {
+    id: row.id || `f-${Date.now()}`,
+    feederName: row.feederName || row.feeder_name || 'Unknown Feeder',
+    district: row.district || 'Team A',
+    direction: row.direction || null,
+    type: row.type || InterruptionType.EARTH_FAULT,
+    status: row.status || InterruptionStatus.ACTIVE,
+    startTime: row.startTime || row.start_time || new Date().toISOString(),
+    estimatedRestorationTime: row.estimatedRestorationTime || row.estimated_restoration_time || 'N/A',
+    affectedArea: row.affectedArea || row.affected_area || '',
+    remark: row.remark || '',
+    lastUpdated: row.lastUpdated || row.last_updated || new Date().toISOString()
+  };
+}
+
+function normalizeNotification(row: any): SystemNotification {
+  return {
+    id: row.id,
+    feederId: row.feederId || row.feeder_id,
+    type: row.type || 'info',
+    title: row.title || 'Notification',
+    message: row.message || '',
+    timestamp: row.timestamp || new Date().toISOString(),
+    read: Boolean(row.read)
+  };
+}
+
+function normalizeTeamLeaderNote(row: any): TeamLeaderNote {
+  return {
+    id: row.id,
+    content: row.content || '',
+    author: row.author || 'Team Leader',
+    timestamp: row.timestamp || new Date().toISOString(),
+    isUrgent: Boolean(row.isUrgent ?? row.is_urgent)
+  };
+}
+
+function normalizeTeamLeader(row: any): TeamLeaderUser {
+  return {
+    id: row.id,
+    username: row.username,
+    password: row.password,
+    name: row.name,
+    district: row.district || 'Admin',
+    role: row.role || 'team_leader',
+    mustChangePassword: Boolean(row.mustChangePassword ?? row.must_change_password),
+    createdAt: row.createdAt || row.created_at || new Date().toISOString()
+  };
+}
+
 // ==========================================
-// 1. FEEDER INTERRUPTIONS (PROXIED VIA /api/interruptions)
+// 1. FEEDER INTERRUPTIONS
 // ==========================================
 
 export async function fetchInterruptions(): Promise<FeederInterruption[]> {
-  try {
-    const data = await apiFetch<FeederInterruption[]>('/api/interruptions');
-    if (data && Array.isArray(data)) {
-      setLocal('eeu-interruptions', data);
-      return data;
-    }
-  } catch (err) {
-    console.warn('fetchInterruptions error:', err);
+  // 1. Try server proxy if available
+  if (serverProxyAvailable) {
+    try {
+      const data = await apiFetch<FeederInterruption[]>('/api/interruptions');
+      if (data && Array.isArray(data)) {
+        setLocal('eeu-interruptions', data);
+        return data;
+      }
+    } catch {}
   }
+
+  // 2. Direct Supabase Query (for GitHub Pages / static mode)
+  if (supabase) {
+    try {
+      const { data, error } = await supabase.from('interruptions').select('*');
+      if (!error && Array.isArray(data) && data.length > 0) {
+        const normalized = data.map(normalizeInterruption);
+        setLocal('eeu-interruptions', normalized);
+        return normalized;
+      }
+    } catch {}
+  }
+
+  // 3. LocalStorage fallback
   return getLocal<FeederInterruption[]>('eeu-interruptions', []);
 }
 
@@ -230,46 +324,28 @@ export async function syncInterruptionsWithServer(localItems: FeederInterruption
   if (!Array.isArray(localItems) || localItems.length === 0) {
     return fetchInterruptions();
   }
-  try {
-    const res = await apiFetch<FeederInterruption[]>('/api/interruptions/sync', {
-      method: 'POST',
-      body: JSON.stringify({ items: localItems })
-    });
-    if (res && Array.isArray(res)) {
-      setLocal('eeu-interruptions', res);
-      return res;
-    }
-  } catch (err) {
-    console.warn('syncInterruptionsWithServer error:', err);
+  if (serverProxyAvailable) {
+    try {
+      const res = await apiFetch<FeederInterruption[]>('/api/interruptions/sync', {
+        method: 'POST',
+        body: JSON.stringify({ items: localItems })
+      });
+      if (res && Array.isArray(res)) {
+        setLocal('eeu-interruptions', res);
+        return res;
+      }
+    } catch {}
   }
   return localItems;
 }
 
 export async function manualRefreshAllData(): Promise<{ success: boolean; count: number }> {
   try {
-    // 1. Sync local interruptions with server
-    const local = getLocal<FeederInterruption[]>('eeu-interruptions', []);
-    const [interruptions, notifications, teamLeaders, notes] = await Promise.all([
-      local.length > 0 ? syncInterruptionsWithServer(local) : fetchInterruptions(),
-      apiFetch<SystemNotification[]>('/api/notifications'),
-      apiFetch<TeamLeaderUser[]>('/api/teamLeaders'),
-      apiFetch<TeamLeaderNote[]>('/api/teamLeaderNotes')
-    ]);
+    const interruptions = await fetchInterruptions();
+    const notifications = await fetchNotifications();
+    const teamLeaders = await fetchTeamLeaders();
+    const notes = await fetchTeamLeaderNotes();
 
-    if (interruptions && Array.isArray(interruptions)) {
-      setLocal('eeu-interruptions', interruptions);
-    }
-    if (notifications && Array.isArray(notifications)) {
-      setLocal('eeu-notifications', notifications);
-    }
-    if (teamLeaders && Array.isArray(teamLeaders)) {
-      setLocal('eeu-team-leaders', teamLeaders);
-    }
-    if (notes && Array.isArray(notes)) {
-      setLocal('eeu-team-leader-notes', notes);
-    }
-
-    // Trigger all listeners
     broadcastGlobalSync('interruptions');
     broadcastGlobalSync('notifications');
     broadcastGlobalSync('teamLeaders');
@@ -289,78 +365,44 @@ export async function manualRefreshAllData(): Promise<{ success: boolean; count:
 }
 
 export function subscribeToInterruptions(onUpdate: (items: FeederInterruption[]) => void) {
-  // 1. Immediately emit cached data for instantaneous 0ms render
   const cached = getLocal<FeederInterruption[]>('eeu-interruptions', []);
   if (cached && cached.length > 0) {
     onUpdate(cached);
   }
 
-  const fetchBackend = async () => {
-    try {
-      const data = await apiFetch<FeederInterruption[]>('/api/interruptions');
-      if (data && Array.isArray(data)) {
-        // If server had 0 items but client has items, push client items to server
-        if (data.length === 0) {
-          const localItems = getLocal<FeederInterruption[]>('eeu-interruptions', []);
-          if (localItems && localItems.length > 0) {
-            const synced = await syncInterruptionsWithServer(localItems);
-            onUpdate(synced);
-            return true;
-          }
-        }
-        onUpdate(data);
-        setLocal('eeu-interruptions', data);
-        return true;
-      }
-    } catch (err) {
-      console.warn('Backend fetch error for interruptions:', err);
+  const doFetch = async () => {
+    const data = await fetchInterruptions();
+    if (data && Array.isArray(data)) {
+      onUpdate(data);
     }
-    return false;
   };
 
-  const fetchFallback = () => {
-    onUpdate(getLocal('eeu-interruptions', []));
-  };
+  doFetch();
 
-  // Initial load
-  fetchBackend().then(success => {
-    if (!success) fetchFallback();
-  });
-
-  // Register on Shared Realtime Sync
   getSharedRealtimeChannel();
   const onSync = () => {
-    fetchBackend();
+    doFetch();
   };
   syncListeners.interruptions.add(onSync);
 
-  // Automatic refresh when switching back to tab
   const handleVisibility = () => {
     if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
-      fetchBackend();
+      doFetch();
     }
-  };
-  const handleFocus = () => {
-    fetchBackend();
   };
   if (typeof window !== 'undefined') {
     window.addEventListener('visibilitychange', handleVisibility);
-    window.addEventListener('focus', handleFocus);
+    window.addEventListener('focus', doFetch);
   }
 
-  // Periodic polling fallback every 4 seconds to guarantee freshness
-  const interval = setInterval(() => {
-    fetchBackend().then(success => {
-      if (!success) fetchFallback();
-    });
-  }, 4000);
+  const interval = setInterval(doFetch, 5000);
 
   return () => {
     syncListeners.interruptions.delete(onSync);
     clearInterval(interval);
     if (typeof window !== 'undefined') {
       window.removeEventListener('visibilitychange', handleVisibility);
-      window.removeEventListener('focus', handleFocus);
+      window.removeEventListener('focus', doFetch);
     }
   };
 }
@@ -386,11 +428,9 @@ export async function addInterruptionDoc(entry: Omit<FeederInterruption, 'id' | 
     lastUpdated: timestampStr
   };
 
-  // 1. Update localStorage immediately for instant UI update
-  try {
-    const existing = getLocal<FeederInterruption[]>('eeu-interruptions', []);
-    setLocal('eeu-interruptions', [record, ...existing.filter(i => i.id !== newId)]);
-  } catch {}
+  // 1. LocalStorage Immediate
+  const existing = getLocal<FeederInterruption[]>('eeu-interruptions', []);
+  setLocal('eeu-interruptions', [record, ...existing.filter(i => i.id !== newId)]);
 
   const notiId = `n-${Date.now()}-${suffix}`;
   const newNoti: SystemNotification = {
@@ -403,28 +443,50 @@ export async function addInterruptionDoc(entry: Omit<FeederInterruption, 'id' | 
     read: false
   };
 
-  try {
-    const existingNotis = getLocal<SystemNotification[]>('eeu-notifications', []);
-    setLocal('eeu-notifications', [newNoti, ...existingNotis]);
-  } catch {}
+  const existingNotis = getLocal<SystemNotification[]>('eeu-notifications', []);
+  setLocal('eeu-notifications', [newNoti, ...existingNotis]);
 
-  // 2. Post to backend proxy
-  const saved = await apiFetch<FeederInterruption>('/api/interruptions', {
-    method: 'POST',
-    body: JSON.stringify(record)
-  });
+  // 2. Server Proxy or Direct Supabase
+  if (serverProxyAvailable) {
+    apiFetch<FeederInterruption>('/api/interruptions', {
+      method: 'POST',
+      body: JSON.stringify(record)
+    }).catch(() => {});
+    apiFetch('/api/notifications', {
+      method: 'POST',
+      body: JSON.stringify(newNoti)
+    }).catch(() => {});
+  } else if (supabase) {
+    safeSupa(() => supabase.from('interruptions').upsert({
+      id: record.id,
+      feeder_name: record.feederName,
+      district: record.district,
+      direction: record.direction,
+      type: record.type,
+      status: record.status,
+      start_time: record.startTime,
+      estimated_restoration_time: record.estimatedRestorationTime,
+      affected_area: record.affectedArea,
+      remark: record.remark,
+      last_updated: record.lastUpdated
+    })).then((res: any) => {
+      if (res?.error) notifyIfRlsError('interruptions', res.error);
+    });
 
-  // Post notification
-  apiFetch<SystemNotification>('/api/notifications', {
-    method: 'POST',
-    body: JSON.stringify(newNoti)
-  }).catch(() => {});
+    safeSupa(() => supabase.from('notifications').upsert({
+      id: newNoti.id,
+      feeder_id: newNoti.feederId,
+      type: newNoti.type,
+      title: newNoti.title,
+      message: newNoti.message,
+      timestamp: newNoti.timestamp,
+      read: newNoti.read
+    }));
+  }
 
-  // Broadcast sync
   broadcastGlobalSync('interruptions');
   broadcastGlobalSync('notifications');
-
-  return saved || record;
+  return record;
 }
 
 export async function updateInterruptionDoc(id: string, entry: Partial<FeederInterruption>, existingRecord?: FeederInterruption) {
@@ -434,11 +496,9 @@ export async function updateInterruptionDoc(id: string, entry: Partial<FeederInt
 
   const merged = { ...existingRecord, ...entry, lastUpdated: timestampStr };
 
-  // 1. Update localStorage immediately
-  try {
-    const existing = getLocal<FeederInterruption[]>('eeu-interruptions', []);
-    setLocal('eeu-interruptions', existing.map(i => i.id === id ? { ...i, ...merged } : i));
-  } catch {}
+  // 1. Update localStorage
+  const existing = getLocal<FeederInterruption[]>('eeu-interruptions', []);
+  setLocal('eeu-interruptions', existing.map(i => i.id === id ? { ...i, ...merged } : i));
 
   let changeNoti: SystemNotification | null = null;
   if (entry.status && existingRecord?.status && entry.status !== existingRecord.status) {
@@ -459,58 +519,109 @@ export async function updateInterruptionDoc(id: string, entry: Partial<FeederInt
       read: false
     };
 
-    try {
-      const existingNotis = getLocal<SystemNotification[]>('eeu-notifications', []);
-      setLocal('eeu-notifications', [changeNoti, ...existingNotis]);
-    } catch {}
+    const existingNotis = getLocal<SystemNotification[]>('eeu-notifications', []);
+    setLocal('eeu-notifications', [changeNoti, ...existingNotis]);
   }
 
-  // 2. Update via server-side proxy
-  const updatePayload: Record<string, any> = {
-    lastUpdated: timestampStr
-  };
-  if (entry.status !== undefined) updatePayload.status = entry.status;
-  if (entry.remark !== undefined) updatePayload.remark = entry.remark;
-  if (entry.estimatedRestorationTime !== undefined) updatePayload.estimatedRestorationTime = entry.estimatedRestorationTime;
-  if (entry.feederName !== undefined) updatePayload.feederName = entry.feederName;
-  if (entry.district !== undefined) updatePayload.district = entry.district;
-  if (entry.type !== undefined) updatePayload.type = entry.type;
-  if (entry.startTime !== undefined) updatePayload.startTime = entry.startTime;
-  if (entry.affectedArea !== undefined) updatePayload.affectedArea = entry.affectedArea;
-  if (entry.direction !== undefined) updatePayload.direction = entry.direction;
+  // 2. Server proxy or Direct Supabase
+  if (serverProxyAvailable) {
+    const updatePayload: Record<string, any> = { lastUpdated: timestampStr };
+    if (entry.status !== undefined) updatePayload.status = entry.status;
+    if (entry.remark !== undefined) updatePayload.remark = entry.remark;
+    if (entry.estimatedRestorationTime !== undefined) updatePayload.estimatedRestorationTime = entry.estimatedRestorationTime;
+    if (entry.feederName !== undefined) updatePayload.feederName = entry.feederName;
+    if (entry.district !== undefined) updatePayload.district = entry.district;
+    if (entry.type !== undefined) updatePayload.type = entry.type;
+    if (entry.startTime !== undefined) updatePayload.startTime = entry.startTime;
+    if (entry.affectedArea !== undefined) updatePayload.affectedArea = entry.affectedArea;
+    if (entry.direction !== undefined) updatePayload.direction = entry.direction;
 
-  await apiFetch(`/api/interruptions/${id}`, {
-    method: 'PUT',
-    body: JSON.stringify(updatePayload)
-  });
-
-  if (changeNoti) {
-    apiFetch('/api/notifications', {
-      method: 'POST',
-      body: JSON.stringify(changeNoti)
+    apiFetch(`/api/interruptions/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(updatePayload)
     }).catch(() => {});
-    broadcastGlobalSync('notifications');
+
+    if (changeNoti) {
+      apiFetch('/api/notifications', {
+        method: 'POST',
+        body: JSON.stringify(changeNoti)
+      }).catch(() => {});
+      broadcastGlobalSync('notifications');
+    }
+  } else if (supabase) {
+    const supaUpdate: any = { last_updated: timestampStr };
+    if (entry.status !== undefined) supaUpdate.status = entry.status;
+    if (entry.remark !== undefined) supaUpdate.remark = entry.remark;
+    if (entry.estimatedRestorationTime !== undefined) supaUpdate.estimated_restoration_time = entry.estimatedRestorationTime;
+    if (entry.feederName !== undefined) supaUpdate.feeder_name = entry.feederName;
+    if (entry.district !== undefined) supaUpdate.district = entry.district;
+    if (entry.type !== undefined) supaUpdate.type = entry.type;
+    if (entry.startTime !== undefined) supaUpdate.start_time = entry.startTime;
+    if (entry.affectedArea !== undefined) supaUpdate.affected_area = entry.affectedArea;
+    if (entry.direction !== undefined) supaUpdate.direction = entry.direction;
+
+    safeSupa(() => supabase.from('interruptions').update(supaUpdate).eq('id', id)).then((res: any) => {
+      if (res?.error) notifyIfRlsError('interruptions', res.error);
+    });
+
+    if (changeNoti) {
+      safeSupa(() => supabase.from('notifications').upsert({
+        id: changeNoti!.id,
+        feeder_id: changeNoti!.feederId,
+        type: changeNoti!.type,
+        title: changeNoti!.title,
+        message: changeNoti!.message,
+        timestamp: changeNoti!.timestamp,
+        read: changeNoti!.read
+      }));
+      broadcastGlobalSync('notifications');
+    }
   }
 
   broadcastGlobalSync('interruptions');
 }
 
 export async function deleteInterruptionDoc(id: string) {
-  try {
-    const existing = getLocal<FeederInterruption[]>('eeu-interruptions', []);
-    setLocal('eeu-interruptions', existing.filter(i => i.id !== id));
-  } catch {}
+  const existing = getLocal<FeederInterruption[]>('eeu-interruptions', []);
+  setLocal('eeu-interruptions', existing.filter(i => i.id !== id));
 
-  await apiFetch(`/api/interruptions/${id}`, {
-    method: 'DELETE'
-  });
+  if (serverProxyAvailable) {
+    apiFetch(`/api/interruptions/${id}`, { method: 'DELETE' }).catch(() => {});
+  } else if (supabase) {
+    safeSupa(() => supabase.from('interruptions').delete().eq('id', id));
+  }
 
   broadcastGlobalSync('interruptions');
 }
 
 // ==========================================
-// 2. NOTIFICATIONS (PROXIED VIA /api/notifications)
+// 2. NOTIFICATIONS
 // ==========================================
+
+export async function fetchNotifications(): Promise<SystemNotification[]> {
+  if (serverProxyAvailable) {
+    try {
+      const data = await apiFetch<SystemNotification[]>('/api/notifications');
+      if (data && Array.isArray(data)) {
+        setLocal('eeu-notifications', data);
+        return data;
+      }
+    } catch {}
+  }
+
+  if (supabase) {
+    try {
+      const { data, error } = await supabase.from('notifications').select('*');
+      if (!error && Array.isArray(data)) {
+        const normalized = data.map(normalizeNotification);
+        setLocal('eeu-notifications', normalized);
+        return normalized;
+      }
+    } catch {}
+  }
+
+  return getLocal<SystemNotification[]>('eeu-notifications', []);
+}
 
 export function subscribeToNotifications(onUpdate: (items: SystemNotification[]) => void) {
   const cached = getLocal<SystemNotification[]>('eeu-notifications', []);
@@ -518,46 +629,31 @@ export function subscribeToNotifications(onUpdate: (items: SystemNotification[])
     onUpdate(cached);
   }
 
-  const fetchBackend = async () => {
-    try {
-      const data = await apiFetch<SystemNotification[]>('/api/notifications');
-      if (data && Array.isArray(data)) {
-        onUpdate(data);
-        setLocal('eeu-notifications', data);
-        return true;
-      }
-    } catch {}
-    return false;
+  const doFetch = async () => {
+    const data = await fetchNotifications();
+    if (data && Array.isArray(data)) {
+      onUpdate(data);
+    }
   };
 
-  const fetchFallback = () => {
-    onUpdate(getLocal('eeu-notifications', []));
-  };
-
-  fetchBackend().then(success => {
-    if (!success) fetchFallback();
-  });
+  doFetch();
 
   getSharedRealtimeChannel();
   const onSync = () => {
-    fetchBackend();
+    doFetch();
   };
   syncListeners.notifications.add(onSync);
 
   const handleVisibility = () => {
     if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
-      fetchBackend();
+      doFetch();
     }
   };
   if (typeof window !== 'undefined') {
     window.addEventListener('visibilitychange', handleVisibility);
   }
 
-  const interval = setInterval(() => {
-    fetchBackend().then(success => {
-      if (!success) fetchFallback();
-    });
-  }, 4000);
+  const interval = setInterval(doFetch, 5000);
 
   return () => {
     syncListeners.notifications.delete(onSync);
@@ -569,39 +665,39 @@ export function subscribeToNotifications(onUpdate: (items: SystemNotification[])
 }
 
 export async function markAllNotificationsAsReadDoc() {
-  try {
-    const existing = getLocal<SystemNotification[]>('eeu-notifications', []);
-    setLocal('eeu-notifications', existing.map(n => ({ ...n, read: true })));
-  } catch {}
+  const existing = getLocal<SystemNotification[]>('eeu-notifications', []);
+  setLocal('eeu-notifications', existing.map(n => ({ ...n, read: true })));
 
-  await apiFetch('/api/notifications/read-all', {
-    method: 'PUT'
-  });
+  if (serverProxyAvailable) {
+    apiFetch('/api/notifications/read-all', { method: 'PUT' }).catch(() => {});
+  } else if (supabase) {
+    safeSupa(() => supabase.from('notifications').update({ read: true }).neq('id', ''));
+  }
 
   broadcastGlobalSync('notifications');
 }
 
 export async function markOneNotificationAsReadDoc(id: string) {
-  try {
-    const existing = getLocal<SystemNotification[]>('eeu-notifications', []);
-    setLocal('eeu-notifications', existing.map(n => n.id === id ? { ...n, read: true } : n));
-  } catch {}
+  const existing = getLocal<SystemNotification[]>('eeu-notifications', []);
+  setLocal('eeu-notifications', existing.map(n => n.id === id ? { ...n, read: true } : n));
 
-  await apiFetch(`/api/notifications/${id}/read`, {
-    method: 'PUT'
-  });
+  if (serverProxyAvailable) {
+    apiFetch(`/api/notifications/${id}/read`, { method: 'PUT' }).catch(() => {});
+  } else if (supabase) {
+    safeSupa(() => supabase.from('notifications').update({ read: true }).eq('id', id));
+  }
 
   broadcastGlobalSync('notifications');
 }
 
 export async function clearAllNotificationsDoc() {
-  try {
-    setLocal('eeu-notifications', []);
-  } catch {}
+  setLocal('eeu-notifications', []);
 
-  await apiFetch('/api/notifications', {
-    method: 'DELETE'
-  });
+  if (serverProxyAvailable) {
+    apiFetch('/api/notifications', { method: 'DELETE' }).catch(() => {});
+  } else if (supabase) {
+    safeSupa(() => supabase.from('notifications').delete().neq('id', ''));
+  }
 
   broadcastGlobalSync('notifications');
 }
@@ -610,6 +706,33 @@ export async function clearAllNotificationsDoc() {
 // 3. PRESET FEEDERS LIST
 // ==========================================
 
+export async function fetchPresetFeeders(): Promise<string[]> {
+  if (serverProxyAvailable) {
+    try {
+      const data = await apiFetch<string[]>('/api/presetFeeders');
+      if (data && Array.isArray(data) && data.length > 0) {
+        setLocal('eeu-feeders-list-v4', data);
+        return data;
+      }
+    } catch {}
+  }
+
+  if (supabase) {
+    try {
+      const { data, error } = await supabase.from('preset_feeders').select('*');
+      if (!error && Array.isArray(data) && data.length > 0) {
+        const list = data.map((d: any) => d.feeder_str || d.feederStr || d.id).filter(Boolean);
+        if (list.length > 0) {
+          setLocal('eeu-feeders-list-v4', list);
+          return list;
+        }
+      }
+    } catch {}
+  }
+
+  return getLocal<string[]>('eeu-feeders-list-v4', INITIAL_FEEDERS_LIST);
+}
+
 export function subscribeToFeedersList(onUpdate: (items: string[]) => void) {
   const load = () => {
     const data = getLocal<string[]>('eeu-feeders-list-v4', INITIAL_FEEDERS_LIST);
@@ -617,13 +740,11 @@ export function subscribeToFeedersList(onUpdate: (items: string[]) => void) {
   };
   load();
 
-  // Also query server for preset feeders
-  apiFetch<string[]>('/api/presetFeeders').then(feeders => {
+  fetchPresetFeeders().then(feeders => {
     if (feeders && Array.isArray(feeders) && feeders.length > 0) {
-      setLocal('eeu-feeders-list-v4', feeders);
       onUpdate(feeders);
     }
-  }).catch(() => {});
+  });
 
   const handleStorage = (e: StorageEvent) => {
     if (e.key === 'eeu-feeders-list-v4') load();
@@ -637,12 +758,11 @@ export function subscribeToFeedersList(onUpdate: (items: string[]) => void) {
 
   getSharedRealtimeChannel();
   const onSync = () => {
-    apiFetch<string[]>('/api/presetFeeders').then(feeders => {
+    fetchPresetFeeders().then(feeders => {
       if (feeders && Array.isArray(feeders) && feeders.length > 0) {
-        setLocal('eeu-feeders-list-v4', feeders);
         onUpdate(feeders);
       }
-    }).catch(() => {});
+    });
   };
   syncListeners.presetFeeders.add(onSync);
 
@@ -656,69 +776,100 @@ export function subscribeToFeedersList(onUpdate: (items: string[]) => void) {
 }
 
 export async function addPresetFeederDoc(feederStr: string) {
-  try {
-    const existing = getLocal<string[]>('eeu-feeders-list-v4', INITIAL_FEEDERS_LIST);
-    const updated = Array.from(new Set([...existing, feederStr])).sort();
-    setLocal('eeu-feeders-list-v4', updated);
-    if (typeof window !== 'undefined') {
-      window.dispatchEvent(new CustomEvent('eeu-feeders-updated'));
-    }
-  } catch {}
+  const existing = getLocal<string[]>('eeu-feeders-list-v4', INITIAL_FEEDERS_LIST);
+  const updated = Array.from(new Set([...existing, feederStr])).sort();
+  setLocal('eeu-feeders-list-v4', updated);
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('eeu-feeders-updated'));
+  }
 
-  apiFetch('/api/presetFeeders', {
-    method: 'POST',
-    body: JSON.stringify({ feederStr })
-  }).catch(() => {});
+  if (serverProxyAvailable) {
+    apiFetch('/api/presetFeeders', {
+      method: 'POST',
+      body: JSON.stringify({ feederStr })
+    }).catch(() => {});
+  } else if (supabase) {
+    safeSupa(() => supabase.from('preset_feeders').upsert({ id: feederStr, feeder_str: feederStr }));
+  }
 }
 
 export async function deletePresetFeederDoc(feederStr: string) {
-  try {
-    const existing = getLocal<string[]>('eeu-feeders-list-v4', INITIAL_FEEDERS_LIST);
-    const updated = existing.filter(f => f !== feederStr);
-    setLocal('eeu-feeders-list-v4', updated);
-    if (typeof window !== 'undefined') {
-      window.dispatchEvent(new CustomEvent('eeu-feeders-updated'));
-    }
-  } catch {}
+  const existing = getLocal<string[]>('eeu-feeders-list-v4', INITIAL_FEEDERS_LIST);
+  const updated = existing.filter(f => f !== feederStr);
+  setLocal('eeu-feeders-list-v4', updated);
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('eeu-feeders-updated'));
+  }
 
-  apiFetch(`/api/presetFeeders/${encodeURIComponent(feederStr)}`, {
-    method: 'DELETE'
-  }).catch(() => {});
+  if (serverProxyAvailable) {
+    apiFetch(`/api/presetFeeders/${encodeURIComponent(feederStr)}`, {
+      method: 'DELETE'
+    }).catch(() => {});
+  } else if (supabase) {
+    safeSupa(() => supabase.from('preset_feeders').delete().eq('id', feederStr));
+  }
 }
 
 export async function updatePresetFeederDoc(oldFeederStr: string, newFeederStr: string) {
-  try {
-    const existing = getLocal<string[]>('eeu-feeders-list-v4', INITIAL_FEEDERS_LIST);
-    const updated = existing.map(f => f === oldFeederStr ? newFeederStr : f);
-    setLocal('eeu-feeders-list-v4', updated);
-    if (typeof window !== 'undefined') {
-      window.dispatchEvent(new CustomEvent('eeu-feeders-updated'));
-    }
-  } catch {}
+  const existing = getLocal<string[]>('eeu-feeders-list-v4', INITIAL_FEEDERS_LIST);
+  const updated = existing.map(f => f === oldFeederStr ? newFeederStr : f);
+  setLocal('eeu-feeders-list-v4', updated);
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('eeu-feeders-updated'));
+  }
 
-  apiFetch('/api/presetFeeders', {
-    method: 'PUT',
-    body: JSON.stringify({ oldFeederStr, newFeederStr })
-  }).catch(() => {});
+  if (serverProxyAvailable) {
+    apiFetch('/api/presetFeeders', {
+      method: 'PUT',
+      body: JSON.stringify({ oldFeederStr, newFeederStr })
+    }).catch(() => {});
+  } else if (supabase) {
+    safeSupa(() => supabase.from('preset_feeders').delete().eq('id', oldFeederStr));
+    safeSupa(() => supabase.from('preset_feeders').upsert({ id: newFeederStr, feeder_str: newFeederStr }));
+  }
 }
 
 export async function resetAllPresetFeedersToMaster() {
-  try {
-    setLocal('eeu-feeders-list-v4', INITIAL_FEEDERS_LIST);
-    if (typeof window !== 'undefined') {
-      window.dispatchEvent(new CustomEvent('eeu-feeders-updated'));
-    }
-  } catch {}
+  setLocal('eeu-feeders-list-v4', INITIAL_FEEDERS_LIST);
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('eeu-feeders-updated'));
+  }
 
-  apiFetch('/api/presetFeeders/bulk', {
-    method: 'POST',
-    body: JSON.stringify({ feeders: INITIAL_FEEDERS_LIST })
-  }).catch(() => {});
+  if (serverProxyAvailable) {
+    apiFetch('/api/presetFeeders/bulk', {
+      method: 'POST',
+      body: JSON.stringify({ feeders: INITIAL_FEEDERS_LIST })
+    }).catch(() => {});
+  }
 }
 
 // ==========================================
 // 4. HUB RECORDS
 // ==========================================
+
+export async function fetchHubRecords(): Promise<HubRecord[]> {
+  if (serverProxyAvailable) {
+    try {
+      const data = await apiFetch<HubRecord[]>('/api/hubRecords');
+      if (data && Array.isArray(data) && data.length > 0) {
+        setLocal('eeu-hub-records', data);
+        return data;
+      }
+    } catch {}
+  }
+
+  if (supabase) {
+    try {
+      const { data, error } = await supabase.from('hub_records').select('*');
+      if (!error && Array.isArray(data) && data.length > 0) {
+        setLocal('eeu-hub-records', data);
+        return data;
+      }
+    } catch {}
+  }
+
+  return getLocal<HubRecord[]>('eeu-hub-records', HUB_RECORDS);
+}
 
 export function subscribeToHubRecords(onUpdate: (items: HubRecord[]) => void) {
   const load = () => {
@@ -739,13 +890,11 @@ export function subscribeToHubRecords(onUpdate: (items: HubRecord[]) => void) {
 
   load();
 
-  // Also sync with server
-  apiFetch<HubRecord[]>('/api/hubRecords').then(records => {
+  fetchHubRecords().then(records => {
     if (records && Array.isArray(records) && records.length > 0) {
-      setLocal('eeu-hub-records', records);
-      onUpdate(records);
+      load();
     }
-  }).catch(() => {});
+  });
 
   const handleStorage = (e: StorageEvent) => {
     if (e.key === 'eeu-hub-records') load();
@@ -759,12 +908,7 @@ export function subscribeToHubRecords(onUpdate: (items: HubRecord[]) => void) {
 
   getSharedRealtimeChannel();
   const onSync = () => {
-    apiFetch<HubRecord[]>('/api/hubRecords').then(records => {
-      if (records && Array.isArray(records) && records.length > 0) {
-        setLocal('eeu-hub-records', records);
-        onUpdate(records);
-      }
-    }).catch(() => {});
+    fetchHubRecords().then(() => load());
   };
   syncListeners.hubRecords.add(onSync);
 
@@ -778,19 +922,32 @@ export function subscribeToHubRecords(onUpdate: (items: HubRecord[]) => void) {
 }
 
 export async function updateHubRecordDoc(record: HubRecord) {
-  try {
-    const stored = getLocal<HubRecord[]>('eeu-hub-records', HUB_RECORDS);
-    const updated = stored.map(item => item.no === record.no ? { ...item, ...record } : item);
-    setLocal('eeu-hub-records', updated);
-    if (typeof window !== 'undefined') {
-      window.dispatchEvent(new CustomEvent('eeu-hub-records-updated'));
-    }
-  } catch {}
+  const stored = getLocal<HubRecord[]>('eeu-hub-records', HUB_RECORDS);
+  const updated = stored.map(item => item.no === record.no ? { ...item, ...record } : item);
+  setLocal('eeu-hub-records', updated);
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('eeu-hub-records-updated'));
+  }
 
-  apiFetch(`/api/hubRecords/${record.no}`, {
-    method: 'PUT',
-    body: JSON.stringify(record)
-  }).catch(() => {});
+  if (serverProxyAvailable) {
+    apiFetch(`/api/hubRecords/${record.no}`, {
+      method: 'PUT',
+      body: JSON.stringify(record)
+    }).catch(() => {});
+  } else if (supabase) {
+    safeSupa(() => supabase.from('hub_records').upsert({
+      no: record.no,
+      region: record.region,
+      csc: record.csc,
+      address: record.address,
+      dummy_bp: record.dummyBp,
+      rsg: record.rsg,
+      dispatcher_name: record.dispatcherName,
+      dispatcher_id: record.dispatcherId,
+      customer_service_tl_id: record.customerServiceTlId,
+      office_location: record.officeLocation
+    }));
+  }
 }
 
 export async function resetHubRecordsToDefaultDoc() {
@@ -799,14 +956,39 @@ export async function resetHubRecordsToDefaultDoc() {
     window.dispatchEvent(new CustomEvent('eeu-hub-records-updated'));
   }
 
-  apiFetch('/api/hubRecords/reset', {
-    method: 'POST'
-  }).catch(() => {});
+  if (serverProxyAvailable) {
+    apiFetch('/api/hubRecords/reset', { method: 'POST' }).catch(() => {});
+  }
 }
 
 // ==========================================
-// 5. TEAM LEADER NOTES (PROXIED VIA /api/teamLeaderNotes)
+// 5. TEAM LEADER NOTES
 // ==========================================
+
+export async function fetchTeamLeaderNotes(): Promise<TeamLeaderNote[]> {
+  if (serverProxyAvailable) {
+    try {
+      const data = await apiFetch<TeamLeaderNote[]>('/api/teamLeaderNotes');
+      if (data && Array.isArray(data)) {
+        setLocal('eeu-team-leader-notes', data);
+        return data;
+      }
+    } catch {}
+  }
+
+  if (supabase) {
+    try {
+      const { data, error } = await supabase.from('team_leader_notes').select('*');
+      if (!error && Array.isArray(data)) {
+        const normalized = data.map(normalizeTeamLeaderNote);
+        setLocal('eeu-team-leader-notes', normalized);
+        return normalized;
+      }
+    } catch {}
+  }
+
+  return getLocal<TeamLeaderNote[]>('eeu-team-leader-notes', []);
+}
 
 export function subscribeToTeamLeaderNotes(onUpdate: (items: TeamLeaderNote[]) => void) {
   const cached = getLocal<TeamLeaderNote[]>('eeu-team-leader-notes', []);
@@ -814,37 +996,22 @@ export function subscribeToTeamLeaderNotes(onUpdate: (items: TeamLeaderNote[]) =
     onUpdate(cached);
   }
 
-  const fetchBackend = async () => {
-    try {
-      const data = await apiFetch<TeamLeaderNote[]>('/api/teamLeaderNotes');
-      if (data && Array.isArray(data)) {
-        onUpdate(data);
-        setLocal('eeu-team-leader-notes', data);
-        return true;
-      }
-    } catch {}
-    return false;
+  const doFetch = async () => {
+    const data = await fetchTeamLeaderNotes();
+    if (data && Array.isArray(data)) {
+      onUpdate(data);
+    }
   };
 
-  const fetchFallback = () => {
-    onUpdate(getLocal('eeu-team-leader-notes', []));
-  };
-
-  fetchBackend().then(success => {
-    if (!success) fetchFallback();
-  });
+  doFetch();
 
   getSharedRealtimeChannel();
   const onSync = () => {
-    fetchBackend();
+    doFetch();
   };
   syncListeners.teamLeaderNotes.add(onSync);
 
-  const interval = setInterval(() => {
-    fetchBackend().then(success => {
-      if (!success) fetchFallback();
-    });
-  }, 4000);
+  const interval = setInterval(doFetch, 5000);
 
   return () => {
     syncListeners.teamLeaderNotes.delete(onSync);
@@ -859,58 +1026,72 @@ export async function addTeamLeaderNoteDoc(content: string, author: string, isUr
   });
 
   const record: TeamLeaderNote = { id: cleanId, content, author: author || "Team Leader", timestamp: timestampStr, isUrgent };
-  try {
-    const existing = getLocal<TeamLeaderNote[]>('eeu-team-leader-notes', []);
-    setLocal('eeu-team-leader-notes', [record, ...existing]);
-  } catch {}
+  const existing = getLocal<TeamLeaderNote[]>('eeu-team-leader-notes', []);
+  setLocal('eeu-team-leader-notes', [record, ...existing]);
 
-  const saved = await apiFetch<TeamLeaderNote>('/api/teamLeaderNotes', {
-    method: 'POST',
-    body: JSON.stringify(record)
-  });
+  if (serverProxyAvailable) {
+    apiFetch<TeamLeaderNote>('/api/teamLeaderNotes', {
+      method: 'POST',
+      body: JSON.stringify(record)
+    }).catch(() => {});
+  } else if (supabase) {
+    safeSupa(() => supabase.from('team_leader_notes').upsert({
+      id: record.id,
+      content: record.content,
+      author: record.author,
+      timestamp: record.timestamp,
+      is_urgent: record.isUrgent
+    }));
+  }
 
   broadcastGlobalSync('teamLeaderNotes');
-  return saved || record;
+  return record;
 }
 
 export async function updateTeamLeaderNoteDoc(id: string, content: string, isUrgent: boolean) {
   const timestampStr = new Date().toLocaleString('en-US', {
     month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: true
   });
-  try {
-    const existing = getLocal<TeamLeaderNote[]>('eeu-team-leader-notes', []);
-    setLocal('eeu-team-leader-notes', existing.map(n => n.id === id ? { ...n, content, isUrgent, timestamp: timestampStr } : n));
-  } catch {}
+  const existing = getLocal<TeamLeaderNote[]>('eeu-team-leader-notes', []);
+  setLocal('eeu-team-leader-notes', existing.map(n => n.id === id ? { ...n, content, isUrgent, timestamp: timestampStr } : n));
 
-  await apiFetch(`/api/teamLeaderNotes/${id}`, {
-    method: 'PUT',
-    body: JSON.stringify({ content, isUrgent, timestamp: timestampStr })
-  });
+  if (serverProxyAvailable) {
+    apiFetch(`/api/teamLeaderNotes/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify({ content, isUrgent, timestamp: timestampStr })
+    }).catch(() => {});
+  } else if (supabase) {
+    safeSupa(() => supabase.from('team_leader_notes').update({
+      content,
+      is_urgent: isUrgent,
+      timestamp: timestampStr
+    }).eq('id', id));
+  }
 
   broadcastGlobalSync('teamLeaderNotes');
 }
 
 export async function deleteTeamLeaderNoteDoc(id: string) {
-  try {
-    const existing = getLocal<TeamLeaderNote[]>('eeu-team-leader-notes', []);
-    setLocal('eeu-team-leader-notes', existing.filter(n => n.id !== id));
-  } catch {}
+  const existing = getLocal<TeamLeaderNote[]>('eeu-team-leader-notes', []);
+  setLocal('eeu-team-leader-notes', existing.filter(n => n.id !== id));
 
-  await apiFetch(`/api/teamLeaderNotes/${id}`, {
-    method: 'DELETE'
-  });
+  if (serverProxyAvailable) {
+    apiFetch(`/api/teamLeaderNotes/${id}`, { method: 'DELETE' }).catch(() => {});
+  } else if (supabase) {
+    safeSupa(() => supabase.from('team_leader_notes').delete().eq('id', id));
+  }
 
   broadcastGlobalSync('teamLeaderNotes');
 }
 
 export async function clearTeamLeaderNotes() {
-  try {
-    setLocal('eeu-team-leader-notes', []);
-  } catch {}
+  setLocal('eeu-team-leader-notes', []);
 
-  await apiFetch('/api/teamLeaderNotes', {
-    method: 'DELETE'
-  });
+  if (serverProxyAvailable) {
+    apiFetch('/api/teamLeaderNotes', { method: 'DELETE' }).catch(() => {});
+  } else if (supabase) {
+    safeSupa(() => supabase.from('team_leader_notes').delete().neq('id', ''));
+  }
 
   broadcastGlobalSync('teamLeaderNotes');
 }
@@ -918,6 +1099,38 @@ export async function clearTeamLeaderNotes() {
 // ==========================================
 // 6. CUSTOMER CONTACTS
 // ==========================================
+
+export async function fetchCustomerContacts(): Promise<ContactItem[]> {
+  if (serverProxyAvailable) {
+    try {
+      const data = await apiFetch<ContactItem[]>('/api/customerContacts');
+      if (data && Array.isArray(data) && data.length > 0) {
+        setLocal('eeu-customer-contacts', data);
+        return data;
+      }
+    } catch {}
+  }
+
+  if (supabase) {
+    try {
+      const { data, error } = await supabase.from('customer_contacts').select('*');
+      if (!error && Array.isArray(data) && data.length > 0) {
+        const normalized = data.map((c: any) => ({
+          id: c.id,
+          name: c.name,
+          phone: c.phone,
+          category: c.category,
+          locationInfo: c.locationInfo || c.location_info,
+          hotlineShortCode: c.hotlineShortCode || c.hotline_short_code
+        }));
+        setLocal('eeu-customer-contacts', normalized);
+        return normalized;
+      }
+    } catch {}
+  }
+
+  return getLocal<ContactItem[]>('eeu-customer-contacts', INITIAL_CUSTOMER_CONTACTS);
+}
 
 export function subscribeToCustomerContacts(onUpdate: (items: ContactItem[]) => void) {
   const load = () => {
@@ -934,12 +1147,7 @@ export function subscribeToCustomerContacts(onUpdate: (items: ContactItem[]) => 
 
   load();
 
-  apiFetch<ContactItem[]>('/api/customerContacts').then(contacts => {
-    if (contacts && Array.isArray(contacts) && contacts.length > 0) {
-      setLocal('eeu-customer-contacts', contacts);
-      load();
-    }
-  }).catch(() => {});
+  fetchCustomerContacts().then(() => load());
 
   const handleStorage = (e: StorageEvent) => {
     if (e.key === 'eeu-customer-contacts') load();
@@ -953,12 +1161,7 @@ export function subscribeToCustomerContacts(onUpdate: (items: ContactItem[]) => 
 
   getSharedRealtimeChannel();
   const onSync = () => {
-    apiFetch<ContactItem[]>('/api/customerContacts').then(contacts => {
-      if (contacts && Array.isArray(contacts) && contacts.length > 0) {
-        setLocal('eeu-customer-contacts', contacts);
-        load();
-      }
-    }).catch(() => {});
+    fetchCustomerContacts().then(() => load());
   };
   syncListeners.customerContacts.add(onSync);
 
@@ -974,54 +1177,100 @@ export function subscribeToCustomerContacts(onUpdate: (items: ContactItem[]) => 
 export async function addCustomerContactDoc(item: Omit<ContactItem, 'id'>) {
   const newId = `cc-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
   const record: ContactItem = { ...item, id: newId };
-  try {
-    const existing = getLocal<ContactItem[]>('eeu-customer-contacts', INITIAL_CUSTOMER_CONTACTS);
-    setLocal('eeu-customer-contacts', [...existing, record]);
-    if (typeof window !== 'undefined') {
-      window.dispatchEvent(new CustomEvent('eeu-customer-contacts-updated'));
-    }
-  } catch {}
+  const existing = getLocal<ContactItem[]>('eeu-customer-contacts', INITIAL_CUSTOMER_CONTACTS);
+  setLocal('eeu-customer-contacts', [...existing, record]);
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('eeu-customer-contacts-updated'));
+  }
 
-  apiFetch('/api/customerContacts', {
-    method: 'POST',
-    body: JSON.stringify(record)
-  }).catch(() => {});
+  if (serverProxyAvailable) {
+    apiFetch('/api/customerContacts', {
+      method: 'POST',
+      body: JSON.stringify(record)
+    }).catch(() => {});
+  } else if (supabase) {
+    safeSupa(() => supabase.from('customer_contacts').upsert({
+      id: record.id,
+      name: record.name,
+      phone: record.phone,
+      category: record.category,
+      location_info: record.locationInfo,
+      hotline_short_code: record.hotlineShortCode
+    }));
+  }
 
   return record;
 }
 
 export async function updateCustomerContactDoc(item: ContactItem) {
-  try {
-    const existing = getLocal<ContactItem[]>('eeu-customer-contacts', INITIAL_CUSTOMER_CONTACTS);
-    setLocal('eeu-customer-contacts', existing.map(c => c.id === item.id ? item : c));
-    if (typeof window !== 'undefined') {
-      window.dispatchEvent(new CustomEvent('eeu-customer-contacts-updated'));
-    }
-  } catch {}
+  const existing = getLocal<ContactItem[]>('eeu-customer-contacts', INITIAL_CUSTOMER_CONTACTS);
+  setLocal('eeu-customer-contacts', existing.map(c => c.id === item.id ? item : c));
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('eeu-customer-contacts-updated'));
+  }
 
-  apiFetch(`/api/customerContacts/${item.id}`, {
-    method: 'PUT',
-    body: JSON.stringify(item)
-  }).catch(() => {});
+  if (serverProxyAvailable) {
+    apiFetch(`/api/customerContacts/${item.id}`, {
+      method: 'PUT',
+      body: JSON.stringify(item)
+    }).catch(() => {});
+  } else if (supabase) {
+    safeSupa(() => supabase.from('customer_contacts').upsert({
+      id: item.id,
+      name: item.name,
+      phone: item.phone,
+      category: item.category,
+      location_info: item.locationInfo,
+      hotline_short_code: item.hotlineShortCode
+    }));
+  }
 }
 
 export async function deleteCustomerContactDoc(id: string) {
-  try {
-    const existing = getLocal<ContactItem[]>('eeu-customer-contacts', INITIAL_CUSTOMER_CONTACTS);
-    setLocal('eeu-customer-contacts', existing.filter(c => c.id !== id));
-    if (typeof window !== 'undefined') {
-      window.dispatchEvent(new CustomEvent('eeu-customer-contacts-updated'));
-    }
-  } catch {}
+  const existing = getLocal<ContactItem[]>('eeu-customer-contacts', INITIAL_CUSTOMER_CONTACTS);
+  setLocal('eeu-customer-contacts', existing.filter(c => c.id !== id));
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('eeu-customer-contacts-updated'));
+  }
 
-  apiFetch(`/api/customerContacts/${id}`, {
-    method: 'DELETE'
-  }).catch(() => {});
+  if (serverProxyAvailable) {
+    apiFetch(`/api/customerContacts/${id}`, { method: 'DELETE' }).catch(() => {});
+  } else if (supabase) {
+    safeSupa(() => supabase.from('customer_contacts').delete().eq('id', id));
+  }
 }
 
 // ==========================================
-// 7. TEAM LEADERS & USERS (PROXIED VIA /api/teamLeaders)
+// 7. TEAM LEADERS & USERS
 // ==========================================
+
+export async function fetchTeamLeaders(): Promise<TeamLeaderUser[]> {
+  if (serverProxyAvailable) {
+    try {
+      const data = await apiFetch<TeamLeaderUser[]>('/api/teamLeaders');
+      if (data && Array.isArray(data) && data.length > 0) {
+        data.sort((a: any, b: any) => (a.name || '').localeCompare(b.name || ''));
+        setLocal('eeu-team-leaders', data);
+        return data;
+      }
+    } catch {}
+  }
+
+  if (supabase) {
+    try {
+      const { data, error } = await supabase.from('team_leaders').select('*');
+      if (!error && Array.isArray(data) && data.length > 0) {
+        const normalized = data.map(normalizeTeamLeader);
+        normalized.sort((a: any, b: any) => (a.name || '').localeCompare(b.name || ''));
+        setLocal('eeu-team-leaders', normalized);
+        return normalized;
+      }
+    } catch {}
+  }
+
+  const stored = getLocal<TeamLeaderUser[]>('eeu-team-leaders', DEFAULT_TEAM_LEADERS);
+  return stored.length > 0 ? stored : DEFAULT_TEAM_LEADERS;
+}
 
 export function subscribeToTeamLeaders(onUpdate: (items: TeamLeaderUser[]) => void) {
   const getInitial = (): TeamLeaderUser[] => {
@@ -1033,44 +1282,25 @@ export function subscribeToTeamLeaders(onUpdate: (items: TeamLeaderUser[]) => vo
     return stored;
   };
 
-  // Immediate cached render
   const initial = getInitial();
   onUpdate(initial);
 
-  const fetchBackend = async () => {
-    try {
-      const data = await apiFetch<TeamLeaderUser[]>('/api/teamLeaders');
-      if (data && Array.isArray(data) && data.length > 0) {
-        data.sort((a: any, b: any) => (a.name || '').localeCompare(b.name || ''));
-        onUpdate(data);
-        setLocal('eeu-team-leaders', data);
-        return true;
-      }
-    } catch {}
-    return false;
+  const doFetch = async () => {
+    const leaders = await fetchTeamLeaders();
+    if (leaders && Array.isArray(leaders) && leaders.length > 0) {
+      onUpdate(leaders);
+    }
   };
 
-  const fetchFallback = () => {
-    const fallback = getInitial();
-    fallback.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
-    onUpdate(fallback);
-  };
-
-  fetchBackend().then(success => {
-    if (!success) fetchFallback();
-  });
+  doFetch();
 
   getSharedRealtimeChannel();
   const onSync = () => {
-    fetchBackend();
+    doFetch();
   };
   syncListeners.teamLeaders.add(onSync);
 
-  const interval = setInterval(() => {
-    fetchBackend().then(success => {
-      if (!success) fetchFallback();
-    });
-  }, 4000);
+  const interval = setInterval(doFetch, 5000);
 
   return () => {
     syncListeners.teamLeaders.delete(onSync);
@@ -1091,23 +1321,30 @@ export async function addTeamLeaderDoc(item: Omit<TeamLeaderUser, 'id' | 'create
   };
   if (typeof item.mustChangePassword === 'boolean') record.mustChangePassword = item.mustChangePassword;
 
-  // 1. Local storage immediate save
-  try {
-    const existing = getLocal<TeamLeaderUser[]>('eeu-team-leaders', DEFAULT_TEAM_LEADERS);
-    const updated = [...existing.filter(tl => tl.id !== record.id), record];
-    setLocal('eeu-team-leaders', updated);
-  } catch (err) {
-    console.error('Failed to save team leader to localStorage:', err);
+  const existing = getLocal<TeamLeaderUser[]>('eeu-team-leaders', DEFAULT_TEAM_LEADERS);
+  const updated = [...existing.filter(tl => tl.id !== record.id), record];
+  setLocal('eeu-team-leaders', updated);
+
+  if (serverProxyAvailable) {
+    apiFetch<TeamLeaderUser>('/api/teamLeaders', {
+      method: 'POST',
+      body: JSON.stringify(record)
+    }).catch(() => {});
+  } else if (supabase) {
+    safeSupa(() => supabase.from('team_leaders').upsert({
+      id: record.id,
+      username: record.username,
+      password: record.password,
+      name: record.name,
+      district: record.district,
+      role: record.role,
+      must_change_password: record.mustChangePassword,
+      created_at: record.createdAt
+    }));
   }
 
-  // 2. Server proxy save
-  const saved = await apiFetch<TeamLeaderUser>('/api/teamLeaders', {
-    method: 'POST',
-    body: JSON.stringify(record)
-  });
-
   broadcastGlobalSync('teamLeaders');
-  return saved || record;
+  return record;
 }
 
 export async function updateTeamLeaderDoc(item: TeamLeaderUser) {
@@ -1122,34 +1359,41 @@ export async function updateTeamLeaderDoc(item: TeamLeaderUser) {
   };
   if (typeof item.mustChangePassword === 'boolean') record.mustChangePassword = item.mustChangePassword;
 
-  try {
-    const existing = getLocal<TeamLeaderUser[]>('eeu-team-leaders', DEFAULT_TEAM_LEADERS);
-    const updated = existing.map(tl => tl.id === item.id ? { ...tl, ...record } : tl);
-    setLocal('eeu-team-leaders', updated);
-  } catch (err) {
-    console.error('Failed to update team leader in localStorage:', err);
-  }
+  const existing = getLocal<TeamLeaderUser[]>('eeu-team-leaders', DEFAULT_TEAM_LEADERS);
+  const updated = existing.map(tl => tl.id === item.id ? { ...tl, ...record } : tl);
+  setLocal('eeu-team-leaders', updated);
 
-  await apiFetch(`/api/teamLeaders/${item.id}`, {
-    method: 'PUT',
-    body: JSON.stringify(record)
-  });
+  if (serverProxyAvailable) {
+    apiFetch(`/api/teamLeaders/${item.id}`, {
+      method: 'PUT',
+      body: JSON.stringify(record)
+    }).catch(() => {});
+  } else if (supabase) {
+    safeSupa(() => supabase.from('team_leaders').upsert({
+      id: record.id,
+      username: record.username,
+      password: record.password,
+      name: record.name,
+      district: record.district,
+      role: record.role,
+      must_change_password: record.mustChangePassword,
+      created_at: record.createdAt
+    }));
+  }
 
   broadcastGlobalSync('teamLeaders');
 }
 
 export async function deleteTeamLeaderDoc(id: string) {
-  try {
-    const existing = getLocal<TeamLeaderUser[]>('eeu-team-leaders', DEFAULT_TEAM_LEADERS);
-    const updated = existing.filter(tl => tl.id !== id);
-    setLocal('eeu-team-leaders', updated);
-  } catch (err) {
-    console.error('Failed to delete team leader from localStorage:', err);
-  }
+  const existing = getLocal<TeamLeaderUser[]>('eeu-team-leaders', DEFAULT_TEAM_LEADERS);
+  const updated = existing.filter(tl => tl.id !== id);
+  setLocal('eeu-team-leaders', updated);
 
-  await apiFetch(`/api/teamLeaders/${id}`, {
-    method: 'DELETE'
-  });
+  if (serverProxyAvailable) {
+    apiFetch(`/api/teamLeaders/${id}`, { method: 'DELETE' }).catch(() => {});
+  } else if (supabase) {
+    safeSupa(() => supabase.from('team_leaders').delete().eq('id', id));
+  }
 
   broadcastGlobalSync('teamLeaders');
 }
@@ -1181,15 +1425,26 @@ export async function addFeedbackDoc(feedback: {
     targetEmail: feedback.targetEmail.trim(),
     timestamp: new Date().toISOString()
   };
-  try {
-    const existing = getLocal<FeedbackRecord[]>('eeu-feedback-records', []);
-    setLocal('eeu-feedback-records', [record, ...existing]);
-  } catch {}
 
-  apiFetch('/api/feedbacks', {
-    method: 'POST',
-    body: JSON.stringify(record)
-  }).catch(() => {});
+  const existing = getLocal<FeedbackRecord[]>('eeu-feedback-records', []);
+  setLocal('eeu-feedback-records', [record, ...existing]);
+
+  if (serverProxyAvailable) {
+    apiFetch('/api/feedbacks', {
+      method: 'POST',
+      body: JSON.stringify(record)
+    }).catch(() => {});
+  } else if (supabase) {
+    safeSupa(() => supabase.from('feedbacks').upsert({
+      id: record.id,
+      rating: record.rating,
+      category: record.category,
+      feedback_text: record.feedbackText,
+      submitted_by: record.submittedBy,
+      target_email: record.targetEmail,
+      timestamp: record.timestamp
+    }));
+  }
 
   return record;
 }
