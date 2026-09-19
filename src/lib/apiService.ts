@@ -1,8 +1,6 @@
 import { FeederInterruption, SystemNotification, InterruptionStatus, InterruptionType, TeamLeaderNote, ContactItem, TeamLeaderUser } from '../types';
 import { INITIAL_FEEDERS_LIST, INITIAL_CUSTOMER_CONTACTS } from '../data/mockData';
-import { FEEDERS_VERSION } from '../data/feedersList';
 import { HubRecord, HUB_RECORDS } from '../data/hubData';
-import { supabase, isSupabaseConfigured } from './supabase';
 
 export const DEFAULT_TEAM_LEADERS: TeamLeaderUser[] = [
   { id: 'admin-1', username: 'admin', password: '@Eeu1234', name: 'System Administrator', district: 'Admin', role: 'admin', createdAt: new Date().toISOString() },
@@ -11,7 +9,6 @@ export const DEFAULT_TEAM_LEADERS: TeamLeaderUser[] = [
   { id: 'tl-d', username: 'zz01641821', password: 'eeu1234', name: 'Zekarias Zenebe', district: 'Admin', role: 'admin', createdAt: new Date().toISOString() }
 ];
 
-// Detect if we are running in a purely static environment (e.g. GitHub Pages) where /api/* doesn't exist
 export const isStaticEnvironment = typeof window !== 'undefined' && (
   window.location.hostname.includes('github.io') ||
   window.location.hostname.includes('vercel.app') ||
@@ -21,36 +18,6 @@ export const isStaticEnvironment = typeof window !== 'undefined' && (
 
 let serverProxyAvailable: boolean = !isStaticEnvironment;
 
-async function safeSupa(action: () => PromiseLike<any>) {
-  if (!supabase) return null;
-  try {
-    const res = await action();
-    return res;
-  } catch {
-    return null;
-  }
-}
-
-// Helper to notify UI if an error occurred
-function notifyIfRlsError(table: string, error: any) {
-  if (!error) return;
-  const msg = (error.message || '').toLowerCase();
-  if (
-    error.code === '42501' ||
-    msg.includes('row-level security') ||
-    msg.includes('violates row-level security') ||
-    msg.includes('permission denied') ||
-    msg.includes('rls')
-  ) {
-    if (typeof window !== 'undefined') {
-      window.dispatchEvent(new CustomEvent('supabase-rls-notice', {
-        detail: { table, message: error.message }
-      }));
-    }
-  }
-}
-
-// Local storage persistent fallback helpers
 export function getLocal<T>(key: string, fallback: T): T {
   if (typeof window === 'undefined') return fallback;
   try {
@@ -70,7 +37,7 @@ export function setLocal<T>(key: string, data: T) {
   }
 }
 
-// Generic API caller with auto-fallback to direct Supabase / local
+// Generic API caller
 async function apiFetch<T>(endpoint: string, options?: RequestInit): Promise<T | null> {
   if (!serverProxyAvailable) return null;
   try {
@@ -82,7 +49,6 @@ async function apiFetch<T>(endpoint: string, options?: RequestInit): Promise<T |
       }
     });
     if (res.status === 404) {
-      // Endpoint does not exist (static host like GitHub Pages) - disable proxy to stop 404 log spam
       serverProxyAvailable = false;
       return null;
     }
@@ -92,7 +58,6 @@ async function apiFetch<T>(endpoint: string, options?: RequestInit): Promise<T |
     }
     return (await res.json()) as T;
   } catch {
-    // Network or proxy failure
     return null;
   }
 }
@@ -107,12 +72,6 @@ if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
   }
 }
 
-// ==========================================
-// SHARED REALTIME SYNC ENGINE
-// ==========================================
-let sseSource: EventSource | null = null;
-let directSupabaseChannel: any = null;
-
 const syncListeners = {
   interruptions: new Set<() => void>(),
   notifications: new Set<() => void>(),
@@ -123,52 +82,12 @@ const syncListeners = {
   customerContacts: new Set<() => void>(),
 };
 
+let sseSource: EventSource | null = null;
+
 export function getSharedRealtimeChannel() {
   if (typeof window === 'undefined') return null;
 
-  // 1. ALWAYS subscribe to Supabase Realtime channel across all devices & browsers
-  if (!directSupabaseChannel && supabase) {
-    try {
-      directSupabaseChannel = supabase
-        .channel('eeu_realtime_global_sync')
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'interruptions' }, (payload) => {
-          console.log('[Supabase Realtime] interruptions change:', payload.eventType);
-          broadcastGlobalSync('interruptions');
-        })
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'notifications' }, (payload) => {
-          console.log('[Supabase Realtime] notifications change:', payload.eventType);
-          broadcastGlobalSync('notifications');
-        })
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'team_leaders' }, (payload) => {
-          broadcastGlobalSync('teamLeaders');
-        })
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'teamLeaders' }, (payload) => {
-          broadcastGlobalSync('teamLeaders');
-        })
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'team_leader_notes' }, (payload) => {
-          broadcastGlobalSync('teamLeaderNotes');
-        })
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'teamLeaderNotes' }, (payload) => {
-          broadcastGlobalSync('teamLeaderNotes');
-        })
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'preset_feeders' }, (payload) => {
-          broadcastGlobalSync('presetFeeders');
-        })
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'hub_records' }, (payload) => {
-          broadcastGlobalSync('hubRecords');
-        })
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'customer_contacts' }, (payload) => {
-          broadcastGlobalSync('customerContacts');
-        })
-        .subscribe((status) => {
-          console.log('[Supabase Realtime Channel] Status:', status);
-        });
-    } catch (err) {
-      console.warn('Direct Supabase Realtime subscription note:', err);
-    }
-  }
-
-  // 2. Also connect to SSE stream if server proxy is available
+  // Connect to SSE stream
   if (serverProxyAvailable && !sseSource) {
     try {
       sseSource = new EventSource('/api/sync/stream');
@@ -222,6 +141,7 @@ export function broadcastGlobalSync(topic: keyof typeof syncListeners, meta?: an
   }
 }
 
+
 export async function seedInitialDataIfEmpty() {
   if (typeof window !== 'undefined') {
     const localTL = getLocal<TeamLeaderUser[]>('eeu-team-leaders', []);
@@ -260,202 +180,6 @@ export async function seedInitialDataIfEmpty() {
 let detectedTeamLeadersTable: 'teamLeaders' | 'team_leaders' | null = null;
 let detectedNotesTable: 'teamLeaderNotes' | 'team_leader_notes' | null = null;
 
-// Normalizers for Supabase records (handles both camelCase and snake_case)
-function normalizeInterruption(row: any): FeederInterruption {
-  return {
-    id: row.id || `f-${Date.now()}`,
-    feederName: row.feederName || row.feeder_name || 'Unknown Feeder',
-    district: row.district || 'Team A',
-    direction: row.direction || null,
-    type: row.type || InterruptionType.EARTH_FAULT,
-    status: row.status || InterruptionStatus.ACTIVE,
-    startTime: row.startTime || row.start_time || new Date().toISOString(),
-    estimatedRestorationTime: row.estimatedRestorationTime || row.estimated_restoration_time || 'N/A',
-    affectedArea: row.affectedArea || row.affected_area || '',
-    remark: row.remark || '',
-    lastUpdated: row.lastUpdated || row.last_updated || new Date().toISOString()
-  };
-}
-
-function normalizeNotification(row: any): SystemNotification {
-  return {
-    id: row.id,
-    feederId: row.feederId || row.feeder_id,
-    type: row.type || 'info',
-    title: row.title || 'Notification',
-    message: row.message || '',
-    timestamp: row.timestamp || new Date().toISOString(),
-    read: Boolean(row.read)
-  };
-}
-
-function normalizeTeamLeaderNote(row: any): TeamLeaderNote {
-  return {
-    id: row.id,
-    content: row.content || '',
-    author: row.author || 'Team Leader',
-    timestamp: row.timestamp || new Date().toISOString(),
-    isUrgent: Boolean(row.isUrgent ?? row.is_urgent)
-  };
-}
-
-function normalizeTeamLeader(row: any): TeamLeaderUser {
-  return {
-    id: row.id,
-    username: row.username,
-    password: row.password,
-    name: row.name,
-    district: row.district || 'Admin',
-    role: row.role || 'team_leader',
-    mustChangePassword: Boolean(row.mustChangePassword ?? row.must_change_password),
-    createdAt: row.createdAt || row.created_at || new Date().toISOString()
-  };
-}
-
-// Resilient upsert for interruptions supporting both snake_case and camelCase Supabase schemas
-async function resilientUpsertInterruption(record: FeederInterruption) {
-  if (!supabase) return;
-
-  const snakePayload: Record<string, any> = {
-    id: record.id,
-    feeder_name: record.feederName,
-    district: record.district,
-    direction: record.direction,
-    type: record.type,
-    status: record.status,
-    start_time: record.startTime,
-    estimated_restoration_time: record.estimatedRestorationTime,
-    affected_area: record.affectedArea,
-    remark: record.remark,
-    last_updated: record.lastUpdated
-  };
-
-  const camelPayload: Record<string, any> = {
-    id: record.id,
-    feederName: record.feederName,
-    district: record.district,
-    direction: record.direction,
-    type: record.type,
-    status: record.status,
-    startTime: record.startTime,
-    estimatedRestorationTime: record.estimatedRestorationTime,
-    affectedArea: record.affectedArea,
-    remark: record.remark,
-    lastUpdated: record.lastUpdated
-  };
-
-  try {
-    // 1. Try snake_case
-    const { error: snakeErr } = await supabase.from('interruptions').upsert(snakePayload);
-    if (!snakeErr) return;
-
-    notifyIfRlsError('interruptions', snakeErr);
-
-    // 2. Try camelCase
-    const { error: camelErr } = await supabase.from('interruptions').upsert(camelPayload);
-    if (!camelErr) return;
-
-    // 3. Try without direction in case column doesn't exist yet
-    delete snakePayload.direction;
-    delete camelPayload.direction;
-    const { error: s2 } = await supabase.from('interruptions').upsert(snakePayload);
-    if (!s2) return;
-    await supabase.from('interruptions').upsert(camelPayload);
-  } catch (err) {
-    console.warn('[Supabase Interruption Upsert Exception]', err);
-  }
-}
-
-async function resilientUpdateInterruption(id: string, entry: Partial<FeederInterruption>, timestampStr: string) {
-  if (!supabase) return;
-
-  const snakeUpdate: Record<string, any> = { last_updated: timestampStr };
-  const camelUpdate: Record<string, any> = { lastUpdated: timestampStr };
-
-  if (entry.feederName !== undefined) {
-    snakeUpdate.feeder_name = entry.feederName;
-    camelUpdate.feederName = entry.feederName;
-  }
-  if (entry.district !== undefined) {
-    snakeUpdate.district = entry.district;
-    camelUpdate.district = entry.district;
-  }
-  if (entry.direction !== undefined) {
-    snakeUpdate.direction = entry.direction;
-    camelUpdate.direction = entry.direction;
-  }
-  if (entry.type !== undefined) {
-    snakeUpdate.type = entry.type;
-    camelUpdate.type = entry.type;
-  }
-  if (entry.status !== undefined) {
-    snakeUpdate.status = entry.status;
-    camelUpdate.status = entry.status;
-  }
-  if (entry.startTime !== undefined) {
-    snakeUpdate.start_time = entry.startTime;
-    camelUpdate.startTime = entry.startTime;
-  }
-  if (entry.estimatedRestorationTime !== undefined) {
-    snakeUpdate.estimated_restoration_time = entry.estimatedRestorationTime;
-    camelUpdate.estimatedRestorationTime = entry.estimatedRestorationTime;
-  }
-  if (entry.affectedArea !== undefined) {
-    snakeUpdate.affected_area = entry.affectedArea;
-    camelUpdate.affectedArea = entry.affectedArea;
-  }
-  if (entry.remark !== undefined) {
-    snakeUpdate.remark = entry.remark;
-    camelUpdate.remark = entry.remark;
-  }
-
-  try {
-    const { error: snakeErr } = await supabase.from('interruptions').update(snakeUpdate).eq('id', id);
-    if (!snakeErr) return;
-
-    notifyIfRlsError('interruptions', snakeErr);
-
-    const { error: camelErr } = await supabase.from('interruptions').update(camelUpdate).eq('id', id);
-    if (!camelErr) return;
-
-    // Retry without direction
-    delete snakeUpdate.direction;
-    delete camelUpdate.direction;
-    const { error: s2 } = await supabase.from('interruptions').update(snakeUpdate).eq('id', id);
-    if (!s2) return;
-    await supabase.from('interruptions').update(camelUpdate).eq('id', id);
-  } catch (err) {
-    console.warn('[Supabase Interruption Update Exception]', err);
-  }
-}
-
-async function resilientUpsertNotification(noti: SystemNotification) {
-  if (!supabase) return;
-  try {
-    const snakePayload = {
-      id: noti.id,
-      feeder_id: noti.feederId,
-      type: noti.type,
-      title: noti.title,
-      message: noti.message,
-      timestamp: noti.timestamp,
-      read: noti.read
-    };
-    const { error } = await supabase.from('notifications').upsert(snakePayload);
-    if (error) {
-      const camelPayload = {
-        id: noti.id,
-        feederId: noti.feederId,
-        type: noti.type,
-        title: noti.title,
-        message: noti.message,
-        timestamp: noti.timestamp,
-        read: noti.read
-      };
-      await supabase.from('notifications').upsert(camelPayload);
-    }
-  } catch {}
-}
 
 // ==========================================
 // 1. FEEDER INTERRUPTIONS
@@ -473,19 +197,7 @@ export async function fetchInterruptions(): Promise<FeederInterruption[]> {
     } catch {}
   }
 
-  // 2. Direct Supabase Query (for GitHub Pages / static mode)
-  if (supabase) {
-    try {
-      const { data, error } = await supabase.from('interruptions').select('*');
-      if (!error && Array.isArray(data)) {
-        const normalized = data.map(normalizeInterruption);
-        setLocal('eeu-interruptions', normalized);
-        return normalized;
-      }
-    } catch {}
-  }
-
-  // 3. LocalStorage fallback
+  // 2. LocalStorage fallback
   return getLocal<FeederInterruption[]>('eeu-interruptions', []);
 }
 
@@ -615,7 +327,7 @@ export async function addInterruptionDoc(entry: Omit<FeederInterruption, 'id' | 
   const existingNotis = getLocal<SystemNotification[]>('eeu-notifications', []);
   setLocal('eeu-notifications', [newNoti, ...existingNotis]);
 
-  // 2. Dual Write: Server Proxy AND Direct Supabase
+  // 2. Dual Write: Server Proxy
   if (serverProxyAvailable) {
     apiFetch<FeederInterruption>('/api/interruptions', {
       method: 'POST',
@@ -626,10 +338,6 @@ export async function addInterruptionDoc(entry: Omit<FeederInterruption, 'id' | 
       body: JSON.stringify(newNoti)
     }).catch(() => {});
   }
-
-  // Direct Supabase resilient write
-  resilientUpsertInterruption(record);
-  resilientUpsertNotification(newNoti);
 
   broadcastGlobalSync('interruptions');
   broadcastGlobalSync('notifications');
@@ -670,7 +378,7 @@ export async function updateInterruptionDoc(id: string, entry: Partial<FeederInt
     setLocal('eeu-notifications', [changeNoti, ...existingNotis]);
   }
 
-  // 2. Dual Write: Server proxy AND Direct Supabase
+  // 2. Dual Write: Server proxy
   if (serverProxyAvailable) {
     const updatePayload: Record<string, any> = { lastUpdated: timestampStr };
     if (entry.status !== undefined) updatePayload.status = entry.status;
@@ -697,14 +405,6 @@ export async function updateInterruptionDoc(id: string, entry: Partial<FeederInt
     }
   }
 
-  // Direct Supabase resilient update
-  resilientUpdateInterruption(id, entry, timestampStr);
-
-  if (changeNoti) {
-    resilientUpsertNotification(changeNoti);
-    broadcastGlobalSync('notifications');
-  }
-
   broadcastGlobalSync('interruptions');
 }
 
@@ -714,9 +414,6 @@ export async function deleteInterruptionDoc(id: string) {
 
   if (serverProxyAvailable) {
     apiFetch(`/api/interruptions/${id}`, { method: 'DELETE' }).catch(() => {});
-  }
-  if (supabase) {
-    safeSupa(() => supabase.from('interruptions').delete().eq('id', id));
   }
 
   broadcastGlobalSync('interruptions');
@@ -733,17 +430,6 @@ export async function fetchNotifications(): Promise<SystemNotification[]> {
       if (data && Array.isArray(data)) {
         setLocal('eeu-notifications', data);
         return data;
-      }
-    } catch {}
-  }
-
-  if (supabase) {
-    try {
-      const { data, error } = await supabase.from('notifications').select('*');
-      if (!error && Array.isArray(data)) {
-        const normalized = data.map(normalizeNotification);
-        setLocal('eeu-notifications', normalized);
-        return normalized;
       }
     } catch {}
   }
@@ -798,8 +484,6 @@ export async function markAllNotificationsAsReadDoc() {
 
   if (serverProxyAvailable) {
     apiFetch('/api/notifications/read-all', { method: 'PUT' }).catch(() => {});
-  } else if (supabase) {
-    safeSupa(() => supabase.from('notifications').update({ read: true }).neq('id', ''));
   }
 
   broadcastGlobalSync('notifications');
@@ -811,8 +495,6 @@ export async function markOneNotificationAsReadDoc(id: string) {
 
   if (serverProxyAvailable) {
     apiFetch(`/api/notifications/${id}/read`, { method: 'PUT' }).catch(() => {});
-  } else if (supabase) {
-    safeSupa(() => supabase.from('notifications').update({ read: true }).eq('id', id));
   }
 
   broadcastGlobalSync('notifications');
@@ -823,8 +505,6 @@ export async function clearAllNotificationsDoc() {
 
   if (serverProxyAvailable) {
     apiFetch('/api/notifications', { method: 'DELETE' }).catch(() => {});
-  } else if (supabase) {
-    safeSupa(() => supabase.from('notifications').delete().neq('id', ''));
   }
 
   broadcastGlobalSync('notifications');
@@ -841,19 +521,6 @@ export async function fetchPresetFeeders(): Promise<string[]> {
       if (data && Array.isArray(data) && data.length > 0) {
         setLocal('eeu-feeders-list-v4', data);
         return data;
-      }
-    } catch {}
-  }
-
-  if (supabase) {
-    try {
-      const { data, error } = await supabase.from('preset_feeders').select('*');
-      if (!error && Array.isArray(data) && data.length > 0) {
-        const list = data.map((d: any) => d.feeder_str || d.feederStr || d.id).filter(Boolean);
-        if (list.length > 0) {
-          setLocal('eeu-feeders-list-v4', list);
-          return list;
-        }
       }
     } catch {}
   }
@@ -916,8 +583,6 @@ export async function addPresetFeederDoc(feederStr: string) {
       method: 'POST',
       body: JSON.stringify({ feederStr })
     }).catch(() => {});
-  } else if (supabase) {
-    safeSupa(() => supabase.from('preset_feeders').upsert({ id: feederStr, feeder_str: feederStr }));
   }
 }
 
@@ -933,8 +598,6 @@ export async function deletePresetFeederDoc(feederStr: string) {
     apiFetch(`/api/presetFeeders/${encodeURIComponent(feederStr)}`, {
       method: 'DELETE'
     }).catch(() => {});
-  } else if (supabase) {
-    safeSupa(() => supabase.from('preset_feeders').delete().eq('id', feederStr));
   }
 }
 
@@ -951,9 +614,6 @@ export async function updatePresetFeederDoc(oldFeederStr: string, newFeederStr: 
       method: 'PUT',
       body: JSON.stringify({ oldFeederStr, newFeederStr })
     }).catch(() => {});
-  } else if (supabase) {
-    safeSupa(() => supabase.from('preset_feeders').delete().eq('id', oldFeederStr));
-    safeSupa(() => supabase.from('preset_feeders').upsert({ id: newFeederStr, feeder_str: newFeederStr }));
   }
 }
 
@@ -980,16 +640,6 @@ export async function fetchHubRecords(): Promise<HubRecord[]> {
     try {
       const data = await apiFetch<HubRecord[]>('/api/hubRecords');
       if (data && Array.isArray(data) && data.length > 0) {
-        setLocal('eeu-hub-records', data);
-        return data;
-      }
-    } catch {}
-  }
-
-  if (supabase) {
-    try {
-      const { data, error } = await supabase.from('hub_records').select('*');
-      if (!error && Array.isArray(data) && data.length > 0) {
         setLocal('eeu-hub-records', data);
         return data;
       }
@@ -1062,19 +712,6 @@ export async function updateHubRecordDoc(record: HubRecord) {
       method: 'PUT',
       body: JSON.stringify(record)
     }).catch(() => {});
-  } else if (supabase) {
-    safeSupa(() => supabase.from('hub_records').upsert({
-      no: record.no,
-      region: record.region,
-      csc: record.csc,
-      address: record.address,
-      dummy_bp: record.dummyBp,
-      rsg: record.rsg,
-      dispatcher_name: record.dispatcherName,
-      dispatcher_id: record.dispatcherId,
-      customer_service_tl_id: record.customerServiceTlId,
-      office_location: record.officeLocation
-    }));
   }
 }
 
@@ -1100,20 +737,6 @@ export async function fetchTeamLeaderNotes(): Promise<TeamLeaderNote[]> {
       if (data && Array.isArray(data)) {
         setLocal('eeu-team-leader-notes', data);
         return data;
-      }
-    } catch {}
-  }
-
-  if (supabase) {
-    try {
-      let res = await supabase.from('teamLeaderNotes').select('*');
-      if (res.error) {
-        res = await supabase.from('team_leader_notes').select('*');
-      }
-      if (!res.error && Array.isArray(res.data)) {
-        const normalized = res.data.map(normalizeTeamLeaderNote);
-        setLocal('eeu-team-leader-notes', normalized);
-        return normalized;
       }
     } catch {}
   }
@@ -1166,28 +789,6 @@ export async function addTeamLeaderNoteDoc(content: string, author: string, isUr
       body: JSON.stringify(record)
     }).catch(() => {});
   }
-  if (supabase) {
-    safeSupa(async () => {
-      const { error } = await supabase.from('teamLeaderNotes').upsert({
-        id: record.id,
-        content: record.content,
-        author: record.author,
-        timestamp: record.timestamp,
-        isUrgent: record.isUrgent
-      });
-      if (error) {
-        try {
-          await supabase.from('team_leader_notes').upsert({
-            id: record.id,
-            content: record.content,
-            author: record.author,
-            timestamp: record.timestamp,
-            is_urgent: record.isUrgent
-          });
-        } catch {}
-      }
-    });
-  }
 
   broadcastGlobalSync('teamLeaderNotes');
   return record;
@@ -1206,24 +807,6 @@ export async function updateTeamLeaderNoteDoc(id: string, content: string, isUrg
       body: JSON.stringify({ content, isUrgent, timestamp: timestampStr })
     }).catch(() => {});
   }
-  if (supabase) {
-    safeSupa(async () => {
-      const { error } = await supabase.from('teamLeaderNotes').update({
-        content,
-        isUrgent: isUrgent,
-        timestamp: timestampStr
-      }).eq('id', id);
-      if (error) {
-        try {
-          await supabase.from('team_leader_notes').update({
-            content,
-            is_urgent: isUrgent,
-            timestamp: timestampStr
-          }).eq('id', id);
-        } catch {}
-      }
-    });
-  }
 
   broadcastGlobalSync('teamLeaderNotes');
 }
@@ -1235,14 +818,6 @@ export async function deleteTeamLeaderNoteDoc(id: string) {
   if (serverProxyAvailable) {
     apiFetch(`/api/teamLeaderNotes/${id}`, { method: 'DELETE' }).catch(() => {});
   }
-  if (supabase) {
-    safeSupa(async () => {
-      await supabase.from('teamLeaderNotes').delete().eq('id', id);
-      try {
-        await supabase.from('team_leader_notes').delete().eq('id', id);
-      } catch {}
-    });
-  }
 
   broadcastGlobalSync('teamLeaderNotes');
 }
@@ -1252,14 +827,6 @@ export async function clearTeamLeaderNotes() {
 
   if (serverProxyAvailable) {
     apiFetch('/api/teamLeaderNotes', { method: 'DELETE' }).catch(() => {});
-  }
-  if (supabase) {
-    safeSupa(async () => {
-      await supabase.from('teamLeaderNotes').delete().neq('id', '');
-      try {
-        await supabase.from('team_leader_notes').delete().neq('id', '');
-      } catch {}
-    });
   }
 
   broadcastGlobalSync('teamLeaderNotes');
