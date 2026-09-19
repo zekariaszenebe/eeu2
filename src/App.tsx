@@ -828,6 +828,33 @@ export default function App() {
           </div>
         </footer>
 
+        {/* LIVE TOAST NOTIFICATION */}
+        {liveToast && (
+          <div
+            id="live-toast-alert"
+            className="fixed bottom-6 right-6 z-50 max-w-sm w-full animate-in slide-in-from-bottom-5 duration-300 shadow-2xl rounded-2xl p-4 border flex items-start gap-3 bg-white text-gray-900 border-gray-200"
+          >
+            <div className={`p-2 rounded-xl shrink-0 ${
+              liveToast.type === 'warn' ? 'bg-amber-500/15 text-amber-600' :
+              liveToast.type === 'success' ? 'bg-emerald-500/15 text-emerald-600' :
+              'bg-blue-500/15 text-blue-600'
+            }`}>
+              <Zap className="w-5 h-5" />
+            </div>
+            <div className="flex-1 min-w-0 pr-1">
+              <h4 className="text-xs font-bold font-display text-gray-900">{liveToast.title}</h4>
+              <p className="text-[11px] text-gray-600 mt-0.5 leading-snug">{liveToast.desc}</p>
+            </div>
+            <button
+              id="live-toast-close-btn"
+              onClick={() => setLiveToast(null)}
+              className="p-1 text-gray-400 hover:text-gray-600 rounded-lg cursor-pointer"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
+
         {/* FEEDBACK MODAL */}
         <FeedbackModal
           isOpen={isFeedbackModalOpen}

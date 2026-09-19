@@ -162,6 +162,20 @@ export const InterruptionProvider: React.FC<{ children: React.ReactNode }> = ({ 
           const serializedPrev = JSON.stringify(prev);
           const serializedNext = JSON.stringify(resolvedItems);
           if (serializedPrev === serializedNext) return prev;
+
+          // If previous state existed, check if new interruptions were added by another user
+          if (prev.length > 0 && resolvedItems.length > prev.length) {
+            const prevIds = new Set(prev.map(p => p.id));
+            const newItems = resolvedItems.filter(i => !prevIds.has(i.id));
+            if (newItems.length > 0) {
+              const newest = newItems[0];
+              triggerToast(
+                '⚡ New Outage Logged',
+                `${newest.feederName} (${newest.district}) is now active across all agent dashboards`,
+                'warn'
+              );
+            }
+          }
           
           try {
             localStorage.setItem('eeu-interruptions', serializedNext);
