@@ -5,11 +5,13 @@ import {
   SlidersHorizontal, CheckSquare, Square, CalendarClock, Info,
   Columns, Rows, Zap, ZapOff, Settings, Compass, ArrowUp, ArrowDown, ArrowLeft, ArrowRight,
   Trash2, Edit3, Plus, MessageSquare, AlertCircle, Languages,
-  Undo, Redo, Bold, Italic, Underline, Strikethrough, AlignLeft, AlignCenter, AlignRight, AlignJustify, Table, ChevronDown
+  Undo, Redo, Bold, Italic, Underline, Strikethrough, AlignLeft, AlignCenter, AlignRight, AlignJustify, Table, ChevronDown,
+  RefreshCw
 } from 'lucide-react';
 import { FeederInterruption, InterruptionType, InterruptionStatus, stripBrackets, TeamLeaderNote } from '../types';
 import { INITIAL_DISTRICTS } from '../data/mockData';
 import { addTeamLeaderNoteDoc, updateTeamLeaderNoteDoc, deleteTeamLeaderNoteDoc, subscribeToInterruptions } from '../lib/apiService';
+import { useInterruptions } from '../context/InterruptionContext';
 import { LanguageMode, translateAmharicLocation, formatLocationDisplay } from '../utils/locationLanguage';
 
 export function sanitizeHtml(html: string): string {
@@ -261,6 +263,7 @@ interface AgentViewProps {
 export default function AgentView({ interruptions, onTriggerMockIncident, isAdmin = false, teamLeaderNotes = [] }: AgentViewProps) {
   // Real-time interruptions state listener via onSnapshot
   const [liveInterruptions, setLiveInterruptions] = useState<FeederInterruption[]>(interruptions || []);
+  const { refreshInterruptions, isRefreshing, lastRefreshedAt } = useInterruptions();
 
   useEffect(() => {
     if (interruptions) {
@@ -1013,31 +1016,45 @@ export default function AgentView({ interruptions, onTriggerMockIncident, isAdmi
               </div>
             </div>
 
-            {/* Layout view controls */}
-            <div className="flex items-center p-1 bg-gray-100 dark:bg-gray-950 rounded-xl border border-gray-200 dark:border-gray-800">
+            {/* Layout view controls & Manual Sync Refresh */}
+            <div className="flex items-center gap-2">
+              <div className="flex items-center p-1 bg-gray-100 dark:bg-gray-950 rounded-xl border border-gray-200 dark:border-gray-800">
+                <button
+                  id="layout-horizontal-btn"
+                  onClick={() => setViewLayout('horizontal')}
+                  className={`p-1.5 rounded-lg transition-all cursor-pointer ${viewLayout === 'horizontal' ? 'bg-white dark:bg-gray-800 text-eeu-green shadow-sm' : 'text-gray-400 hover:text-gray-600'}`}
+                  title="Horizontal List Feed"
+                >
+                  <Columns className="w-4 h-4" />
+                </button>
+                <button
+                  id="layout-grid-btn"
+                  onClick={() => setViewLayout('grid')}
+                  className={`p-1.5 rounded-lg transition-all cursor-pointer ${viewLayout === 'grid' ? 'bg-white dark:bg-gray-800 text-eeu-green shadow-sm' : 'text-gray-400 hover:text-gray-600'}`}
+                  title="Bento Grid View"
+                >
+                  <Grid className="w-4 h-4" />
+                </button>
+                <button
+                  id="layout-table-btn"
+                  onClick={() => setViewLayout('table')}
+                  className={`p-1.5 rounded-lg transition-all cursor-pointer ${viewLayout === 'table' ? 'bg-white dark:bg-gray-800 text-eeu-green shadow-sm' : 'text-gray-400 hover:text-gray-600'}`}
+                  title="Sleek Table List View"
+                >
+                  <List className="w-4 h-4" />
+                </button>
+              </div>
+
+              {/* Instant Manual Refresh Button */}
               <button
-                id="layout-horizontal-btn"
-                onClick={() => setViewLayout('horizontal')}
-                className={`p-1.5 rounded-lg transition-all cursor-pointer ${viewLayout === 'horizontal' ? 'bg-white dark:bg-gray-800 text-eeu-green shadow-sm' : 'text-gray-400 hover:text-gray-600'}`}
-                title="Horizontal List Feed"
+                id="agent-manual-refresh-btn"
+                onClick={() => refreshInterruptions()}
+                disabled={isRefreshing}
+                title="Click to manually refresh all active interruptions"
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800/60 rounded-xl text-xs font-bold hover:bg-emerald-100 dark:hover:bg-emerald-900/60 transition-all cursor-pointer disabled:opacity-50"
               >
-                <Columns className="w-4 h-4" />
-              </button>
-              <button
-                id="layout-grid-btn"
-                onClick={() => setViewLayout('grid')}
-                className={`p-1.5 rounded-lg transition-all cursor-pointer ${viewLayout === 'grid' ? 'bg-white dark:bg-gray-800 text-eeu-green shadow-sm' : 'text-gray-400 hover:text-gray-600'}`}
-                title="Bento Grid View"
-              >
-                <Grid className="w-4 h-4" />
-              </button>
-              <button
-                id="layout-table-btn"
-                onClick={() => setViewLayout('table')}
-                className={`p-1.5 rounded-lg transition-all cursor-pointer ${viewLayout === 'table' ? 'bg-white dark:bg-gray-800 text-eeu-green shadow-sm' : 'text-gray-400 hover:text-gray-600'}`}
-                title="Sleek Table List View"
-              >
-                <List className="w-4 h-4" />
+                <RefreshCw className={`w-3.5 h-3.5 text-eeu-green ${isRefreshing ? 'animate-spin' : ''}`} />
+                <span>{isRefreshing ? 'Syncing...' : 'Refresh'}</span>
               </button>
             </div>
           </div>

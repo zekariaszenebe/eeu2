@@ -80,6 +80,9 @@ export default function App() {
     addInterruption: handleAddInterruption,
     updateInterruption: handleUpdateInterruption,
     deleteInterruption: handleDeleteInterruption,
+    refreshInterruptions,
+    isRefreshing,
+    lastRefreshedAt,
     triggerToast,
     liveToast,
     setLiveToast
@@ -510,6 +513,18 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-2">
+            {/* Mobile Refresh Button */}
+            <button
+              id="mob-header-refresh-btn"
+              onClick={() => refreshInterruptions()}
+              disabled={isRefreshing}
+              title="Manually sync and refresh all grid interruptions"
+              className="p-2 text-gray-600 dark:text-gray-300 bg-gray-100 dark:bg-gray-900/60 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-800 transition-all cursor-pointer flex items-center gap-1.5"
+            >
+              <RefreshCw className={`w-4 h-4 text-eeu-green ${isRefreshing ? 'animate-spin' : ''}`} />
+              <span className="text-[11px] font-bold hidden xs:inline">{isRefreshing ? 'Syncing...' : 'Refresh'}</span>
+            </button>
+
             {/* Mobile Hamburger menu */}
             <button
               id="mobile-menu-hamburger"
@@ -666,6 +681,23 @@ export default function App() {
 
               {/* User Profile Pill Card & Action Buttons */}
               <div className="flex items-center gap-2.5">
+                {/* Manual Sync / Refresh Button */}
+                <button
+                  id="header-refresh-sync-btn"
+                  onClick={() => refreshInterruptions()}
+                  disabled={isRefreshing}
+                  title={`Manually synchronize with Grid Server${lastRefreshedAt ? ` (Last: ${lastRefreshedAt.toLocaleTimeString()})` : ''}`}
+                  className="relative h-10 px-3.5 rounded-full bg-white dark:bg-gray-900 border border-gray-200/80 dark:border-gray-800 shadow-xs hover:shadow flex items-center gap-2 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:text-eeu-green dark:hover:text-eeu-green hover:bg-gray-50 dark:hover:bg-gray-800 transition-all cursor-pointer shrink-0 disabled:opacity-60"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 text-eeu-green ${isRefreshing ? 'animate-spin' : ''}`} />
+                  <span>{isRefreshing ? 'Syncing Grid...' : 'Sync Refresh'}</span>
+                  {lastRefreshedAt && !isRefreshing && (
+                    <span className="text-[10px] text-gray-400 font-normal pl-1 border-l border-gray-200 dark:border-gray-700">
+                      {lastRefreshedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                    </span>
+                  )}
+                </button>
+
                 {/* Feedback Button */}
                 <button
                   id="header-feedback-btn"

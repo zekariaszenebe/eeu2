@@ -213,6 +213,81 @@ export async function seedInitialDataIfEmpty() {
 // 1. FEEDER INTERRUPTIONS (PROXIED VIA /api/interruptions)
 // ==========================================
 
+export async function fetchInterruptions(): Promise<FeederInterruption[]> {
+  try {
+    const data = await apiFetch<FeederInterruption[]>('/api/interruptions');
+    if (data && Array.isArray(data)) {
+      setLocal('eeu-interruptions', data);
+      return data;
+    }
+  } catch (err) {
+    console.warn('fetchInterruptions error:', err);
+  }
+  return getLocal<FeederInterruption[]>('eeu-interruptions', []);
+}
+
+export async function syncInterruptionsWithServer(localItems: FeederInterruption[]): Promise<FeederInterruption[]> {
+  if (!Array.isArray(localItems) || localItems.length === 0) {
+    return fetchInterruptions();
+  }
+  try {
+    const res = await apiFetch<FeederInterruption[]>('/api/interruptions/sync', {
+      method: 'POST',
+      body: JSON.stringify({ items: localItems })
+    });
+    if (res && Array.isArray(res)) {
+      setLocal('eeu-interruptions', res);
+      return res;
+    }
+  } catch (err) {
+    console.warn('syncInterruptionsWithServer error:', err);
+  }
+  return localItems;
+}
+
+export async function manualRefreshAllData(): Promise<{ success: boolean; count: number }> {
+  try {
+    // 1. Sync local interruptions with server
+    const local = getLocal<FeederInterruption[]>('eeu-interruptions', []);
+    const [interruptions, notifications, teamLeaders, notes] = await Promise.all([
+      local.length > 0 ? syncInterruptionsWithServer(local) : fetchInterruptions(),
+      apiFetch<SystemNotification[]>('/api/notifications'),
+      apiFetch<TeamLeaderUser[]>('/api/teamLeaders'),
+      apiFetch<TeamLeaderNote[]>('/api/teamLeaderNotes')
+    ]);
+
+    if (interruptions && Array.isArray(interruptions)) {
+      setLocal('eeu-interruptions', interruptions);
+    }
+    if (notifications && Array.isArray(notifications)) {
+      setLocal('eeu-notifications', notifications);
+    }
+    if (teamLeaders && Array.isArray(teamLeaders)) {
+      setLocal('eeu-team-leaders', teamLeaders);
+    }
+    if (notes && Array.isArray(notes)) {
+      setLocal('eeu-team-leader-notes', notes);
+    }
+
+    // Trigger all listeners
+    broadcastGlobalSync('interruptions');
+    broadcastGlobalSync('notifications');
+    broadcastGlobalSync('teamLeaders');
+    broadcastGlobalSync('teamLeaderNotes');
+
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('eeu-manual-refresh-done', { 
+        detail: { count: (interruptions || []).length, timestamp: Date.now() } 
+      }));
+    }
+
+    return { success: true, count: (interruptions || []).length };
+  } catch (err) {
+    console.warn('manualRefreshAllData error:', err);
+    return { success: false, count: 0 };
+  }
+}
+
 export function subscribeToInterruptions(onUpdate: (items: FeederInterruption[]) => void) {
   // 1. Immediately emit cached data for instantaneous 0ms render
   const cached = getLocal<FeederInterruption[]>('eeu-interruptions', []);
@@ -224,6 +299,15 @@ export function subscribeToInterruptions(onUpdate: (items: FeederInterruption[])
     try {
       const data = await apiFetch<FeederInterruption[]>('/api/interruptions');
       if (data && Array.isArray(data)) {
+        // If server had 0 items but client has items, push client items to server
+        if (data.length === 0) {
+          const localItems = getLocal<FeederInterruption[]>('eeu-interruptions', []);
+          if (localItems && localItems.length > 0) {
+            const synced = await syncInterruptionsWithServer(localItems);
+            onUpdate(synced);
+            return true;
+          }
+        }
         onUpdate(data);
         setLocal('eeu-interruptions', data);
         return true;

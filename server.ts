@@ -234,9 +234,12 @@ async function startServer() {
         }
       } catch {}
 
-      const list = Array.from(serverInterruptions.values()).sort(
-        (a, b) => new Date(b.lastUpdated || 0).getTime() - new Date(a.lastUpdated || 0).getTime()
-      );
+      const list = Array.from(serverInterruptions.values()).sort((a: any, b: any) => {
+        const tA = a.createdAt ? new Date(a.createdAt).getTime() : (a.lastUpdated ? new Date(a.lastUpdated).getTime() : 0);
+        const tB = b.createdAt ? new Date(b.createdAt).getTime() : (b.lastUpdated ? new Date(b.lastUpdated).getTime() : 0);
+        if (!isNaN(tA) && !isNaN(tB) && tA !== tB) return tB - tA;
+        return (b.id || "").localeCompare(a.id || "");
+      });
       res.json(list);
     } catch (error: any) {
       console.error("Failed to fetch interruptions:", error);
@@ -245,12 +248,41 @@ async function startServer() {
     }
   });
 
+  // Bulk sync endpoint to reconcile client and server state
+  app.post("/api/interruptions/sync", async (req, res) => {
+    try {
+      const { items } = req.body || {};
+      if (Array.isArray(items)) {
+        for (const item of items) {
+          if (item && item.id) {
+            if (!serverInterruptions.has(item.id)) {
+              serverInterruptions.set(item.id, item);
+              try { addInterruptionRepo(item).catch(() => {}); } catch {}
+            }
+          }
+        }
+      }
+      const list = Array.from(serverInterruptions.values()).sort((a: any, b: any) => {
+        const tA = a.createdAt ? new Date(a.createdAt).getTime() : (a.lastUpdated ? new Date(a.lastUpdated).getTime() : 0);
+        const tB = b.createdAt ? new Date(b.createdAt).getTime() : (b.lastUpdated ? new Date(b.lastUpdated).getTime() : 0);
+        if (!isNaN(tA) && !isNaN(tB) && tA !== tB) return tB - tA;
+        return (b.id || "").localeCompare(a.id || "");
+      });
+      broadcastSse("interruptions", { synced: true, count: list.length });
+      res.json(list);
+    } catch (error: any) {
+      console.error("Failed to sync interruptions:", error);
+      res.json(Array.from(serverInterruptions.values()));
+    }
+  });
+
   app.post("/api/interruptions", async (req, res) => {
     const id = req.body.id || `f-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+    const createdAt = req.body.createdAt || new Date().toISOString();
     const lastUpdated = req.body.lastUpdated || new Date().toLocaleString('en-US', {
       month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: true
     });
-    const item = { ...req.body, id, lastUpdated };
+    const item = { ...req.body, id, createdAt, lastUpdated };
     try {
       // 1. Instantly store in Master Server Memory Map for guaranteed 100% sync
       serverInterruptions.set(id, item);

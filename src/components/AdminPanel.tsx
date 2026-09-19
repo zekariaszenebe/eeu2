@@ -8,6 +8,7 @@ import { FeederInterruption, InterruptionType, InterruptionStatus, stripBrackets
 import { INITIAL_DISTRICTS, INITIAL_FEEDERS_LIST } from '../data/mockData';
 import { InterruptionTypeBadge, getCardinalDirection, CardinalDirection, saveFeederDirectionOverride } from './AgentView';
 import { LanguageMode, translateAmharicLocation, formatLocationDisplay } from '../utils/locationLanguage';
+import { useInterruptions } from '../context/InterruptionContext';
 
 // Helper to parse feeder name and its Amharic location details
 const parseFeeder = (feederStr: string) => {
@@ -97,6 +98,7 @@ export default function AdminPanel({
   onUpdateTeamLeader,
   onDeleteTeamLeader
 }: AdminPanelProps) {
+  const { refreshInterruptions, isRefreshing } = useInterruptions();
   // Authentication variables
   const [pinCode, setPinCode] = useState('');
   const [loginError, setLoginError] = useState(false);
@@ -898,6 +900,16 @@ export default function AdminPanel({
             All Listed Feeder Disruptions ({interruptions.length})
           </h3>
           <div className="flex items-center gap-2">
+            <button
+              id="admin-outages-refresh-btn"
+              onClick={() => refreshInterruptions()}
+              disabled={isRefreshing}
+              title="Synchronize disruptions with central server"
+              className="flex items-center gap-1.5 px-3 py-1 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800/60 rounded-xl text-xs font-bold hover:bg-emerald-100 dark:hover:bg-emerald-900/60 transition-all cursor-pointer disabled:opacity-50"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 text-eeu-green ${isRefreshing ? 'animate-spin' : ''}`} />
+              <span>{isRefreshing ? 'Syncing...' : 'Refresh Board'}</span>
+            </button>
             <span className="text-[10px] font-sans font-bold text-emerald-650 bg-emerald-500/10 dark:bg-emerald-950/30 px-2 py-0.5 rounded border border-emerald-500/25">
               Admin: Write Access Active
             </span>

@@ -5,7 +5,9 @@ import {
   updateInterruptionDoc, 
   deleteInterruptionDoc, 
   subscribeToInterruptions,
-  seedInitialDataIfEmpty
+  seedInitialDataIfEmpty,
+  manualRefreshAllData,
+  fetchInterruptions
 } from '../lib/apiService';
 
 interface InterruptionContextType {
@@ -14,6 +16,9 @@ interface InterruptionContextType {
   addInterruption: (entry: Omit<FeederInterruption, 'id' | 'lastUpdated'>) => Promise<void>;
   updateInterruption: (id: string, entry: Partial<FeederInterruption>) => Promise<void>;
   deleteInterruption: (id: string) => Promise<void>;
+  refreshInterruptions: () => Promise<void>;
+  isRefreshing: boolean;
+  lastRefreshedAt: Date | null;
   triggerToast: (title: string, desc: string, type?: 'info' | 'success' | 'warn') => void;
   liveToast: { title: string; desc: string; type: 'info' | 'success' | 'warn' } | null;
   setLiveToast: React.Dispatch<React.SetStateAction<{ title: string; desc: string; type: 'info' | 'success' | 'warn' } | null>>;
@@ -68,6 +73,8 @@ export const InterruptionProvider: React.FC<{ children: React.ReactNode }> = ({ 
   });
 
   const [liveToast, setLiveToast] = useState<{ title: string; desc: string; type: 'info' | 'success' | 'warn' } | null>(null);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [lastRefreshedAt, setLastRefreshedAt] = useState<Date | null>(() => new Date());
 
   // Protection maps to prevent background polling from reverting optimistic user actions (e.g. marking Restored)
   const pendingUpdatesRef = useRef<Map<string, { record: FeederInterruption; expiresAt: number }>>(new Map());
@@ -346,6 +353,24 @@ export const InterruptionProvider: React.FC<{ children: React.ReactNode }> = ({ 
     }
   };
 
+  const refreshInterruptions = async () => {
+    setIsRefreshing(true);
+    try {
+      const res = await manualRefreshAllData();
+      const fresh = await fetchInterruptions();
+      if (Array.isArray(fresh)) {
+        setInterruptions(fresh);
+      }
+      setLastRefreshedAt(new Date());
+      triggerToast('🔄 Grid Data Synced', `Refreshed all feeder lines, active outages, and notes successfully.`, 'success');
+    } catch (err) {
+      console.error('Manual refresh failed:', err);
+      triggerToast('Refresh Note', 'Local data refreshed. Server sync will retry automatically.', 'info');
+    } finally {
+      setTimeout(() => setIsRefreshing(false), 400);
+    }
+  };
+
   return (
     <InterruptionContext.Provider value={{
       interruptions,
@@ -353,6 +378,9 @@ export const InterruptionProvider: React.FC<{ children: React.ReactNode }> = ({ 
       addInterruption,
       updateInterruption,
       deleteInterruption,
+      refreshInterruptions,
+      isRefreshing,
+      lastRefreshedAt,
       triggerToast,
       liveToast,
       setLiveToast

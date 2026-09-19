@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
-import { History, ShieldCheck, CheckSquare, Search, Award, MapPin, Calendar, Compass, ShieldOff, Languages } from 'lucide-react';
+import { History, ShieldCheck, CheckSquare, Search, Award, MapPin, Calendar, Compass, ShieldOff, Languages, RefreshCw } from 'lucide-react';
 import { FeederInterruption, InterruptionStatus, stripBrackets } from '../types';
 import { translateAmharicLocation } from '../utils/locationLanguage';
+import { useInterruptions } from '../context/InterruptionContext';
 
 interface ResolutionArchiveProps {
   interruptions: FeederInterruption[];
@@ -9,6 +10,7 @@ interface ResolutionArchiveProps {
 
 export default function ResolutionArchive({ interruptions }: ResolutionArchiveProps) {
   const [query, setQuery] = useState('');
+  const { refreshInterruptions, isRefreshing } = useInterruptions();
   
   // Filter for restored entries
   const restoredItems = interruptions.filter(item => {
@@ -35,16 +37,29 @@ export default function ResolutionArchive({ interruptions }: ResolutionArchivePr
           </h3>
         </div>
 
-        <div className="relative min-w-[240px]">
-          <Search className="absolute left-3.5 top-3 w-4 h-4 text-gray-400" />
-          <input
-            id="archive-search"
-            type="text"
-            placeholder="Search by feeder or location (Amharic / English)..."
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            className="w-full pl-10 pr-4 py-2 text-xs rounded-xl glass-input text-gray-900 dark:text-white focus:outline-none focus:ring-1.5 focus:ring-eeu-green"
-          />
+        <div className="flex items-center gap-3 flex-wrap">
+          <button
+            id="archive-refresh-btn"
+            onClick={() => refreshInterruptions()}
+            disabled={isRefreshing}
+            className="flex items-center gap-1.5 px-3 py-2 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800/60 rounded-xl text-xs font-bold hover:bg-emerald-100 dark:hover:bg-emerald-900/60 transition-all cursor-pointer disabled:opacity-50"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 text-eeu-green ${isRefreshing ? 'animate-spin' : ''}`} />
+            <span>{isRefreshing ? 'Syncing...' : 'Refresh'}</span>
+          </button>
+
+          <div className="relative min-w-[240px]">
+            <Search className="absolute left-3.5 top-3 w-4 h-4 text-gray-400" />
+            <input
+              id="archive-search"
+              type="text"
+              placeholder="Search by feeder or location (Amharic / English)..."
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              className="w-full pl-10 pr-4 py-2 text-xs rounded-xl glass-input text-gray-900 dark:text-white focus:outline-none focus:ring-1.5 focus:ring-eeu-green"
+            >
+            </input>
+          </div>
         </div>
       </div>
 
