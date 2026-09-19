@@ -126,29 +126,50 @@ const syncListeners = {
 export function getSharedRealtimeChannel() {
   if (typeof window === 'undefined') return null;
 
-  // 1. If running on static host (e.g. GitHub Pages), subscribe directly to Supabase realtime
-  if (!serverProxyAvailable || isStaticEnvironment) {
-    if (!directSupabaseChannel && supabase) {
-      try {
-        directSupabaseChannel = supabase
-          .channel('eeu_public_changes')
-          .on('postgres_changes', { event: '*', schema: 'public' }, (payload: any) => {
-            const table = (payload.table || '').toLowerCase();
-            if (table.includes('interruption')) broadcastGlobalSync('interruptions');
-            else if (table.includes('notification')) broadcastGlobalSync('notifications');
-            else if (table.includes('leader_note') || table.includes('leadernote')) broadcastGlobalSync('teamLeaderNotes');
-            else if (table.includes('leader')) broadcastGlobalSync('teamLeaders');
-            else if (table.includes('preset') || table.includes('feeder')) broadcastGlobalSync('presetFeeders');
-            else if (table.includes('hub')) broadcastGlobalSync('hubRecords');
-            else if (table.includes('contact')) broadcastGlobalSync('customerContacts');
-          })
-          .subscribe();
-      } catch (err) {
-        console.warn('Direct Supabase Realtime subscription note:', err);
-      }
+  // 1. ALWAYS subscribe to Supabase Realtime channel across all devices & browsers
+  if (!directSupabaseChannel && supabase) {
+    try {
+      directSupabaseChannel = supabase
+        .channel('eeu_realtime_global_sync')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'interruptions' }, (payload) => {
+          console.log('[Supabase Realtime] interruptions change:', payload.eventType);
+          broadcastGlobalSync('interruptions');
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'notifications' }, (payload) => {
+          console.log('[Supabase Realtime] notifications change:', payload.eventType);
+          broadcastGlobalSync('notifications');
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'team_leaders' }, (payload) => {
+          broadcastGlobalSync('teamLeaders');
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'teamLeaders' }, (payload) => {
+          broadcastGlobalSync('teamLeaders');
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'team_leader_notes' }, (payload) => {
+          broadcastGlobalSync('teamLeaderNotes');
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'teamLeaderNotes' }, (payload) => {
+          broadcastGlobalSync('teamLeaderNotes');
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'preset_feeders' }, (payload) => {
+          broadcastGlobalSync('presetFeeders');
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'hub_records' }, (payload) => {
+          broadcastGlobalSync('hubRecords');
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'customer_contacts' }, (payload) => {
+          broadcastGlobalSync('customerContacts');
+        })
+        .subscribe((status) => {
+          console.log('[Supabase Realtime Channel] Status:', status);
+        });
+    } catch (err) {
+      console.warn('Direct Supabase Realtime subscription note:', err);
     }
-  } else if (!sseSource) {
-    // 2. Full-stack mode: Connect to our own SSE stream
+  }
+
+  // 2. Also connect to SSE stream if server proxy is available
+  if (serverProxyAvailable && !sseSource) {
     try {
       sseSource = new EventSource('/api/sync/stream');
 
@@ -168,7 +189,7 @@ export function getSharedRealtimeChannel() {
         // SSE auto-reconnects
       };
     } catch {
-      serverProxyAvailable = false;
+      // ignore
     }
   }
 
@@ -446,7 +467,7 @@ export async function addInterruptionDoc(entry: Omit<FeederInterruption, 'id' | 
   const existingNotis = getLocal<SystemNotification[]>('eeu-notifications', []);
   setLocal('eeu-notifications', [newNoti, ...existingNotis]);
 
-  // 2. Server Proxy or Direct Supabase
+  // 2. Dual Write: Server Proxy AND Direct Supabase
   if (serverProxyAvailable) {
     apiFetch<FeederInterruption>('/api/interruptions', {
       method: 'POST',
@@ -456,7 +477,9 @@ export async function addInterruptionDoc(entry: Omit<FeederInterruption, 'id' | 
       method: 'POST',
       body: JSON.stringify(newNoti)
     }).catch(() => {});
-  } else if (supabase) {
+  }
+
+  if (supabase) {
     safeSupa(() => supabase.from('interruptions').upsert({
       id: record.id,
       feeder_name: record.feederName,
@@ -523,7 +546,7 @@ export async function updateInterruptionDoc(id: string, entry: Partial<FeederInt
     setLocal('eeu-notifications', [changeNoti, ...existingNotis]);
   }
 
-  // 2. Server proxy or Direct Supabase
+  // 2. Dual Write: Server proxy AND Direct Supabase
   if (serverProxyAvailable) {
     const updatePayload: Record<string, any> = { lastUpdated: timestampStr };
     if (entry.status !== undefined) updatePayload.status = entry.status;
@@ -548,7 +571,9 @@ export async function updateInterruptionDoc(id: string, entry: Partial<FeederInt
       }).catch(() => {});
       broadcastGlobalSync('notifications');
     }
-  } else if (supabase) {
+  }
+
+  if (supabase) {
     const supaUpdate: any = { last_updated: timestampStr };
     if (entry.status !== undefined) supaUpdate.status = entry.status;
     if (entry.remark !== undefined) supaUpdate.remark = entry.remark;
@@ -587,7 +612,8 @@ export async function deleteInterruptionDoc(id: string) {
 
   if (serverProxyAvailable) {
     apiFetch(`/api/interruptions/${id}`, { method: 'DELETE' }).catch(() => {});
-  } else if (supabase) {
+  }
+  if (supabase) {
     safeSupa(() => supabase.from('interruptions').delete().eq('id', id));
   }
 
@@ -1188,7 +1214,8 @@ export async function addCustomerContactDoc(item: Omit<ContactItem, 'id'>) {
       method: 'POST',
       body: JSON.stringify(record)
     }).catch(() => {});
-  } else if (supabase) {
+  }
+  if (supabase) {
     safeSupa(() => supabase.from('customer_contacts').upsert({
       id: record.id,
       name: record.name,
@@ -1214,7 +1241,8 @@ export async function updateCustomerContactDoc(item: ContactItem) {
       method: 'PUT',
       body: JSON.stringify(item)
     }).catch(() => {});
-  } else if (supabase) {
+  }
+  if (supabase) {
     safeSupa(() => supabase.from('customer_contacts').upsert({
       id: item.id,
       name: item.name,
@@ -1235,7 +1263,8 @@ export async function deleteCustomerContactDoc(id: string) {
 
   if (serverProxyAvailable) {
     apiFetch(`/api/customerContacts/${id}`, { method: 'DELETE' }).catch(() => {});
-  } else if (supabase) {
+  }
+  if (supabase) {
     safeSupa(() => supabase.from('customer_contacts').delete().eq('id', id));
   }
 }
@@ -1258,9 +1287,12 @@ export async function fetchTeamLeaders(): Promise<TeamLeaderUser[]> {
 
   if (supabase) {
     try {
-      const { data, error } = await supabase.from('team_leaders').select('*');
-      if (!error && Array.isArray(data) && data.length > 0) {
-        const normalized = data.map(normalizeTeamLeader);
+      let res = await supabase.from('team_leaders').select('*');
+      if (res.error) {
+        res = await supabase.from('teamLeaders').select('*');
+      }
+      if (!res.error && Array.isArray(res.data) && res.data.length > 0) {
+        const normalized = res.data.map(normalizeTeamLeader);
         normalized.sort((a: any, b: any) => (a.name || '').localeCompare(b.name || ''));
         setLocal('eeu-team-leaders', normalized);
         return normalized;
@@ -1330,17 +1362,34 @@ export async function addTeamLeaderDoc(item: Omit<TeamLeaderUser, 'id' | 'create
       method: 'POST',
       body: JSON.stringify(record)
     }).catch(() => {});
-  } else if (supabase) {
-    safeSupa(() => supabase.from('team_leaders').upsert({
-      id: record.id,
-      username: record.username,
-      password: record.password,
-      name: record.name,
-      district: record.district,
-      role: record.role,
-      must_change_password: record.mustChangePassword,
-      created_at: record.createdAt
-    }));
+  }
+  if (supabase) {
+    safeSupa(async () => {
+      const { error } = await supabase.from('team_leaders').upsert({
+        id: record.id,
+        username: record.username,
+        password: record.password,
+        name: record.name,
+        district: record.district,
+        role: record.role,
+        must_change_password: record.mustChangePassword,
+        created_at: record.createdAt
+      });
+      if (error) {
+        try {
+          await supabase.from('teamLeaders').upsert({
+            id: record.id,
+            username: record.username,
+            password: record.password,
+            name: record.name,
+            district: record.district,
+            role: record.role,
+            mustChangePassword: record.mustChangePassword,
+            createdAt: record.createdAt
+          });
+        } catch {}
+      }
+    });
   }
 
   broadcastGlobalSync('teamLeaders');
@@ -1368,17 +1417,34 @@ export async function updateTeamLeaderDoc(item: TeamLeaderUser) {
       method: 'PUT',
       body: JSON.stringify(record)
     }).catch(() => {});
-  } else if (supabase) {
-    safeSupa(() => supabase.from('team_leaders').upsert({
-      id: record.id,
-      username: record.username,
-      password: record.password,
-      name: record.name,
-      district: record.district,
-      role: record.role,
-      must_change_password: record.mustChangePassword,
-      created_at: record.createdAt
-    }));
+  }
+  if (supabase) {
+    safeSupa(async () => {
+      const { error } = await supabase.from('team_leaders').upsert({
+        id: record.id,
+        username: record.username,
+        password: record.password,
+        name: record.name,
+        district: record.district,
+        role: record.role,
+        must_change_password: record.mustChangePassword,
+        created_at: record.createdAt
+      });
+      if (error) {
+        try {
+          await supabase.from('teamLeaders').upsert({
+            id: record.id,
+            username: record.username,
+            password: record.password,
+            name: record.name,
+            district: record.district,
+            role: record.role,
+            mustChangePassword: record.mustChangePassword,
+            createdAt: record.createdAt
+          });
+        } catch {}
+      }
+    });
   }
 
   broadcastGlobalSync('teamLeaders');
@@ -1391,8 +1457,14 @@ export async function deleteTeamLeaderDoc(id: string) {
 
   if (serverProxyAvailable) {
     apiFetch(`/api/teamLeaders/${id}`, { method: 'DELETE' }).catch(() => {});
-  } else if (supabase) {
-    safeSupa(() => supabase.from('team_leaders').delete().eq('id', id));
+  }
+  if (supabase) {
+    safeSupa(async () => {
+      await supabase.from('team_leaders').delete().eq('id', id);
+      try {
+        await supabase.from('teamLeaders').delete().eq('id', id);
+      } catch {}
+    });
   }
 
   broadcastGlobalSync('teamLeaders');
@@ -1434,7 +1506,8 @@ export async function addFeedbackDoc(feedback: {
       method: 'POST',
       body: JSON.stringify(record)
     }).catch(() => {});
-  } else if (supabase) {
+  }
+  if (supabase) {
     safeSupa(() => supabase.from('feedbacks').upsert({
       id: record.id,
       rating: record.rating,

@@ -77,8 +77,8 @@ function handleSupabaseTableError(tableName: string, error: any) {
 }
 
 // ========================================================
-// SERVER MASTER IN-MEMORY PERSISTENCE STORE
-// Ensures instant multi-agent sync across all connected browsers
+// SERVER MASTER IN-MEMORY PERSISTENCE STORE & SUPABASE BRIDGE
+// Ensures instant multi-agent sync across all connected browsers & devices
 // ========================================================
 const serverInterruptions = new Map<string, any>();
 const serverNotifications = new Map<string, any>();
@@ -99,6 +99,109 @@ for (const tl of DEFAULT_LEADERS) {
   serverTeamLeaders.set(tl.id, tl);
 }
 
+// Data conversion helpers between App CamelCase and PostgreSQL SnakeCase
+function toSupaInterruption(item: any) {
+  return {
+    id: item.id,
+    feeder_name: item.feederName || item.feeder_name || '',
+    district: item.district || 'Team A',
+    direction: item.direction || null,
+    type: item.type || 'Earth Fault',
+    status: item.status || 'Active',
+    start_time: item.startTime || item.start_time || new Date().toISOString(),
+    estimated_restoration_time: item.estimatedRestorationTime || item.estimated_restoration_time || 'N/A',
+    affected_area: item.affectedArea || item.affected_area || '',
+    remark: item.remark || '',
+    last_updated: item.lastUpdated || item.last_updated || new Date().toISOString()
+  };
+}
+
+function fromSupaInterruption(row: any) {
+  return {
+    id: row.id,
+    feederName: row.feederName || row.feeder_name || 'Unknown Feeder',
+    district: row.district || 'Team A',
+    direction: row.direction || null,
+    type: row.type || 'Earth Fault',
+    status: row.status || 'Active',
+    startTime: row.startTime || row.start_time || '',
+    estimatedRestorationTime: row.estimatedRestorationTime || row.estimated_restoration_time || 'N/A',
+    affectedArea: row.affectedArea || row.affected_area || '',
+    remark: row.remark || '',
+    lastUpdated: row.lastUpdated || row.last_updated || new Date().toISOString()
+  };
+}
+
+function toSupaNotification(item: any) {
+  return {
+    id: item.id,
+    feeder_id: item.feederId || item.feeder_id || null,
+    type: item.type || 'info',
+    title: item.title || 'Notification',
+    message: item.message || '',
+    timestamp: item.timestamp || new Date().toISOString(),
+    read: Boolean(item.read)
+  };
+}
+
+function fromSupaNotification(row: any) {
+  return {
+    id: row.id,
+    feederId: row.feederId || row.feeder_id || undefined,
+    type: row.type || 'info',
+    title: row.title || 'Notification',
+    message: row.message || '',
+    timestamp: row.timestamp || new Date().toISOString(),
+    read: Boolean(row.read)
+  };
+}
+
+function toSupaTeamLeader(item: any) {
+  return {
+    id: item.id,
+    username: item.username,
+    password: item.password,
+    name: item.name,
+    district: item.district || 'Admin',
+    role: item.role || 'team_leader',
+    must_change_password: Boolean(item.mustChangePassword ?? item.must_change_password),
+    created_at: item.createdAt || item.created_at || new Date().toISOString()
+  };
+}
+
+function fromSupaTeamLeader(row: any) {
+  return {
+    id: row.id,
+    username: row.username,
+    password: row.password,
+    name: row.name,
+    district: row.district || 'Admin',
+    role: row.role || 'team_leader',
+    mustChangePassword: Boolean(row.mustChangePassword ?? row.must_change_password),
+    createdAt: row.createdAt || row.created_at || new Date().toISOString()
+  };
+}
+
+function toSupaTeamLeaderNote(item: any) {
+  return {
+    id: item.id,
+    content: item.content || '',
+    author: item.author || 'Team Leader',
+    timestamp: item.timestamp || new Date().toISOString(),
+    is_urgent: Boolean(item.isUrgent ?? item.is_urgent)
+  };
+}
+
+function fromSupaTeamLeaderNote(row: any) {
+  return {
+    id: row.id,
+    content: row.content || '',
+    author: row.author || 'Team Leader',
+    timestamp: row.timestamp || new Date().toISOString(),
+    isUrgent: Boolean(row.isUrgent ?? row.is_urgent)
+  };
+}
+
 // Setup Supabase Realtime listener on the server to bridge updates to SSE clients
 if (isServerSupabaseConfigured) {
   try {
@@ -106,33 +209,89 @@ if (isServerSupabaseConfigured) {
       .channel("server-supabase-bridge")
       .on("postgres_changes", { event: "*", schema: "public", table: "interruptions" }, (payload) => {
         if (payload.new && (payload.new as any).id) {
-          serverInterruptions.set((payload.new as any).id, payload.new);
+          const item = fromSupaInterruption(payload.new);
+          serverInterruptions.set(item.id, item);
+          broadcastSse("interruptions", item);
         } else if (payload.eventType === 'DELETE' && payload.old && (payload.old as any).id) {
           serverInterruptions.delete((payload.old as any).id);
+          broadcastSse("interruptions", { id: (payload.old as any).id, deleted: true });
         }
-        broadcastSse("interruptions", payload);
       })
       .on("postgres_changes", { event: "*", schema: "public", table: "notifications" }, (payload) => {
         if (payload.new && (payload.new as any).id) {
-          serverNotifications.set((payload.new as any).id, payload.new);
+          const noti = fromSupaNotification(payload.new);
+          serverNotifications.set(noti.id, noti);
+          broadcastSse("notifications", noti);
+        } else if (payload.eventType === 'DELETE' && payload.old && (payload.old as any).id) {
+          serverNotifications.delete((payload.old as any).id);
+          broadcastSse("notifications", { id: (payload.old as any).id, deleted: true });
         }
-        broadcastSse("notifications", payload);
+      })
+      .on("postgres_changes", { event: "*", schema: "public", table: "team_leaders" }, (payload) => {
+        if (payload.new && (payload.new as any).id) {
+          const tl = fromSupaTeamLeader(payload.new);
+          serverTeamLeaders.set(tl.id, tl);
+          broadcastSse("teamLeaders", tl);
+        } else if (payload.eventType === 'DELETE' && payload.old && (payload.old as any).id) {
+          serverTeamLeaders.delete((payload.old as any).id);
+          broadcastSse("teamLeaders", { id: (payload.old as any).id, deleted: true });
+        }
       })
       .on("postgres_changes", { event: "*", schema: "public", table: "teamLeaders" }, (payload) => {
         if (payload.new && (payload.new as any).id) {
-          serverTeamLeaders.set((payload.new as any).id, payload.new);
+          const tl = fromSupaTeamLeader(payload.new);
+          serverTeamLeaders.set(tl.id, tl);
+          broadcastSse("teamLeaders", tl);
         }
-        broadcastSse("teamLeaders", payload);
+      })
+      .on("postgres_changes", { event: "*", schema: "public", table: "team_leader_notes" }, (payload) => {
+        if (payload.new && (payload.new as any).id) {
+          const note = fromSupaTeamLeaderNote(payload.new);
+          serverTeamLeaderNotes.set(note.id, note);
+          broadcastSse("teamLeaderNotes", note);
+        } else if (payload.eventType === 'DELETE' && payload.old && (payload.old as any).id) {
+          serverTeamLeaderNotes.delete((payload.old as any).id);
+          broadcastSse("teamLeaderNotes", { id: (payload.old as any).id, deleted: true });
+        }
       })
       .on("postgres_changes", { event: "*", schema: "public", table: "teamLeaderNotes" }, (payload) => {
         if (payload.new && (payload.new as any).id) {
-          serverTeamLeaderNotes.set((payload.new as any).id, payload.new);
+          const note = fromSupaTeamLeaderNote(payload.new);
+          serverTeamLeaderNotes.set(note.id, note);
+          broadcastSse("teamLeaderNotes", note);
         }
-        broadcastSse("teamLeaderNotes", payload);
       })
-      .subscribe();
+      .on("postgres_changes", { event: "*", schema: "public", table: "preset_feeders" }, (payload) => {
+        if (payload.new && ((payload.new as any).feeder_str || (payload.new as any).id)) {
+          const fStr = (payload.new as any).feeder_str || (payload.new as any).id;
+          serverPresetFeeders.add(fStr);
+          broadcastSse("presetFeeders", { added: fStr });
+        } else if (payload.eventType === 'DELETE' && payload.old) {
+          const fStr = (payload.old as any).feeder_str || (payload.old as any).id;
+          if (fStr) serverPresetFeeders.delete(fStr);
+          broadcastSse("presetFeeders", { deleted: fStr });
+        }
+      })
+      .on("postgres_changes", { event: "*", schema: "public", table: "hub_records" }, (payload) => {
+        if (payload.new && typeof (payload.new as any).no === 'number') {
+          serverHubRecords.set((payload.new as any).no, payload.new);
+          broadcastSse("hubRecords", payload.new);
+        }
+      })
+      .on("postgres_changes", { event: "*", schema: "public", table: "customer_contacts" }, (payload) => {
+        if (payload.new && (payload.new as any).id) {
+          serverCustomerContacts.set((payload.new as any).id, payload.new);
+          broadcastSse("customerContacts", payload.new);
+        } else if (payload.eventType === 'DELETE' && payload.old && (payload.old as any).id) {
+          serverCustomerContacts.delete((payload.old as any).id);
+          broadcastSse("customerContacts", { id: (payload.old as any).id, deleted: true });
+        }
+      })
+      .subscribe((status) => {
+        console.log(`[Supabase Bridge] Realtime status: ${status}`);
+      });
   } catch (err) {
-    // Ignore realtime attach issues
+    console.warn("Realtime bridge setup warning:", err);
   }
 }
 
@@ -212,8 +371,9 @@ async function startServer() {
           .order("id", { ascending: false });
 
         if (!error && Array.isArray(data)) {
-          for (const item of data) {
-            if (item && item.id) {
+          for (const rawItem of data) {
+            if (rawItem && rawItem.id) {
+              const item = fromSupaInterruption(rawItem);
               serverInterruptions.set(item.id, item);
             }
           }
@@ -253,11 +413,15 @@ async function startServer() {
     try {
       const { items } = req.body || {};
       if (Array.isArray(items)) {
-        for (const item of items) {
-          if (item && item.id) {
+        for (const raw of items) {
+          if (raw && raw.id) {
+            const item = fromSupaInterruption(raw);
             if (!serverInterruptions.has(item.id)) {
               serverInterruptions.set(item.id, item);
               try { addInterruptionRepo(item).catch(() => {}); } catch {}
+              if (isServerSupabaseConfigured && !missingSupabaseTables.has("interruptions")) {
+                safeSupabaseAction(() => supabaseServer.from("interruptions").upsert(toSupaInterruption(item)));
+              }
             }
           }
         }
@@ -300,21 +464,21 @@ async function startServer() {
       };
       serverNotifications.set(notiId, noti);
 
-      // 3. Write to Supabase asynchronously
+      // 3. Write to Supabase asynchronously with both snake_case and camelCase support
       if (isServerSupabaseConfigured && !missingSupabaseTables.has("interruptions")) {
         safeSupabaseAction(async () => {
-          const { error } = await supabaseServer.from("interruptions").insert(item).select().single();
+          const supaPayload = toSupaInterruption(item);
+          const { error } = await supabaseServer.from("interruptions").upsert(supaPayload);
           if (error) {
-            if (error.message && error.message.toLowerCase().includes("direction")) {
-              const { direction, ...compatRecord } = item;
-              await supabaseServer.from("interruptions").insert(compatRecord);
-            } else {
-              handleSupabaseTableError("interruptions", error);
-            }
+            handleSupabaseTableError("interruptions", error);
+            // Fallback attempt with direct object if custom schema exists
+            try {
+              await supabaseServer.from("interruptions").upsert(item);
+            } catch {}
           }
         });
 
-        safeSupabaseAction(() => supabaseServer.from("notifications").insert(noti));
+        safeSupabaseAction(() => supabaseServer.from("notifications").upsert(toSupaNotification(noti)));
       }
 
       // 4. Write to Cloud SQL repo in background
@@ -344,14 +508,24 @@ async function startServer() {
 
       if (isServerSupabaseConfigured && !missingSupabaseTables.has("interruptions")) {
         safeSupabaseAction(async () => {
-          const { error } = await supabaseServer.from("interruptions").update(updatePayload).eq("id", id);
+          const supaUpdate: any = {};
+          if (updatePayload.feederName !== undefined || updatePayload.feeder_name !== undefined) supaUpdate.feeder_name = updatePayload.feederName || updatePayload.feeder_name;
+          if (updatePayload.district !== undefined) supaUpdate.district = updatePayload.district;
+          if (updatePayload.direction !== undefined) supaUpdate.direction = updatePayload.direction;
+          if (updatePayload.type !== undefined) supaUpdate.type = updatePayload.type;
+          if (updatePayload.status !== undefined) supaUpdate.status = updatePayload.status;
+          if (updatePayload.startTime !== undefined || updatePayload.start_time !== undefined) supaUpdate.start_time = updatePayload.startTime || updatePayload.start_time;
+          if (updatePayload.estimatedRestorationTime !== undefined || updatePayload.estimated_restoration_time !== undefined) supaUpdate.estimated_restoration_time = updatePayload.estimatedRestorationTime || updatePayload.estimated_restoration_time;
+          if (updatePayload.affectedArea !== undefined || updatePayload.affected_area !== undefined) supaUpdate.affected_area = updatePayload.affectedArea || updatePayload.affected_area;
+          if (updatePayload.remark !== undefined) supaUpdate.remark = updatePayload.remark;
+          if (updatePayload.lastUpdated !== undefined || updatePayload.last_updated !== undefined) supaUpdate.last_updated = updatePayload.lastUpdated || updatePayload.last_updated;
+
+          const { error } = await supabaseServer.from("interruptions").update(supaUpdate).eq("id", id);
           if (error) {
-            if (error.message && error.message.toLowerCase().includes("direction")) {
-              const { direction, ...compatPayload } = updatePayload;
-              await supabaseServer.from("interruptions").update(compatPayload).eq("id", id);
-            } else {
-              handleSupabaseTableError("interruptions", error);
-            }
+            handleSupabaseTableError("interruptions", error);
+            try {
+              await supabaseServer.from("interruptions").update(updatePayload).eq("id", id);
+            } catch {}
           }
         });
       }
@@ -402,8 +576,11 @@ async function startServer() {
           .order("timestamp", { ascending: false });
 
         if (!error && Array.isArray(data)) {
-          for (const noti of data) {
-            if (noti && noti.id) serverNotifications.set(noti.id, noti);
+          for (const rawNoti of data) {
+            if (rawNoti && rawNoti.id) {
+              const noti = fromSupaNotification(rawNoti);
+              serverNotifications.set(noti.id, noti);
+            }
           }
         }
       }
@@ -439,7 +616,7 @@ async function startServer() {
       serverNotifications.set(id, item);
 
       if (isServerSupabaseConfigured) {
-        safeSupabaseAction(() => supabaseServer.from("notifications").insert(item));
+        safeSupabaseAction(() => supabaseServer.from("notifications").upsert(toSupaNotification(item)));
       }
 
       try {
@@ -484,7 +661,7 @@ async function startServer() {
       serverNotifications.set(id, updated);
 
       if (isServerSupabaseConfigured) {
-        safeSupabaseAction(() => supabaseServer.from("notifications").update(req.body).eq("id", id));
+        safeSupabaseAction(() => supabaseServer.from("notifications").update(toSupaNotification(updated)).eq("id", id));
       }
       try {
         if (req.body.read) markNotificationReadRepo(id).catch(() => {});
@@ -552,10 +729,16 @@ async function startServer() {
   app.get("/api/teamLeaders", async (req, res) => {
     try {
       if (isServerSupabaseConfigured) {
-        const { data, error } = await supabaseServer.from("teamLeaders").select("*");
-        if (!error && Array.isArray(data)) {
-          for (const tl of data) {
-            if (tl && tl.id) serverTeamLeaders.set(tl.id, tl);
+        let resData = await supabaseServer.from("team_leaders").select("*");
+        if (resData.error) {
+          resData = await supabaseServer.from("teamLeaders").select("*");
+        }
+        if (!resData.error && Array.isArray(resData.data)) {
+          for (const rawTl of resData.data) {
+            if (rawTl && rawTl.id) {
+              const tl = fromSupaTeamLeader(rawTl);
+              serverTeamLeaders.set(tl.id, tl);
+            }
           }
         }
       }
@@ -588,7 +771,15 @@ async function startServer() {
       serverTeamLeaders.set(id, item);
 
       if (isServerSupabaseConfigured) {
-        safeSupabaseAction(() => supabaseServer.from("teamLeaders").insert(item));
+        safeSupabaseAction(async () => {
+          const supaPayload = toSupaTeamLeader(item);
+          const { error } = await supabaseServer.from("team_leaders").upsert(supaPayload);
+          if (error) {
+            try {
+              await supabaseServer.from("teamLeaders").upsert(supaPayload);
+            } catch {}
+          }
+        });
       }
       try {
         addTeamLeaderRepo(item).catch(() => {});
@@ -611,7 +802,15 @@ async function startServer() {
       serverTeamLeaders.set(id, updated);
 
       if (isServerSupabaseConfigured) {
-        safeSupabaseAction(() => supabaseServer.from("teamLeaders").update(item).eq("id", id));
+        safeSupabaseAction(async () => {
+          const supaPayload = toSupaTeamLeader(updated);
+          const { error } = await supabaseServer.from("team_leaders").upsert(supaPayload);
+          if (error) {
+            try {
+              await supabaseServer.from("teamLeaders").upsert(supaPayload);
+            } catch {}
+          }
+        });
       }
       try {
         updateTeamLeaderRepo(id, item).catch(() => {});
@@ -630,7 +829,12 @@ async function startServer() {
     try {
       serverTeamLeaders.delete(id);
       if (isServerSupabaseConfigured) {
-        safeSupabaseAction(() => supabaseServer.from("teamLeaders").delete().eq("id", id));
+        safeSupabaseAction(async () => {
+          await supabaseServer.from("team_leaders").delete().eq("id", id);
+          try {
+            await supabaseServer.from("teamLeaders").delete().eq("id", id);
+          } catch {}
+        });
       }
       try {
         deleteTeamLeaderRepo(id).catch(() => {});
@@ -648,10 +852,16 @@ async function startServer() {
   app.get("/api/teamLeaderNotes", async (req, res) => {
     try {
       if (isServerSupabaseConfigured) {
-        const { data, error } = await supabaseServer.from("teamLeaderNotes").select("*");
-        if (!error && Array.isArray(data)) {
-          for (const note of data) {
-            if (note && note.id) serverTeamLeaderNotes.set(note.id, note);
+        let resData = await supabaseServer.from("team_leader_notes").select("*");
+        if (resData.error) {
+          resData = await supabaseServer.from("teamLeaderNotes").select("*");
+        }
+        if (!resData.error && Array.isArray(resData.data)) {
+          for (const rawNote of resData.data) {
+            if (rawNote && rawNote.id) {
+              const note = fromSupaTeamLeaderNote(rawNote);
+              serverTeamLeaderNotes.set(note.id, note);
+            }
           }
         }
       }
@@ -687,7 +897,15 @@ async function startServer() {
       serverTeamLeaderNotes.set(id, item);
 
       if (isServerSupabaseConfigured) {
-        safeSupabaseAction(() => supabaseServer.from("teamLeaderNotes").insert(item));
+        safeSupabaseAction(async () => {
+          const supaPayload = toSupaTeamLeaderNote(item);
+          const { error } = await supabaseServer.from("team_leader_notes").upsert(supaPayload);
+          if (error) {
+            try {
+              await supabaseServer.from("teamLeaderNotes").upsert(supaPayload);
+            } catch {}
+          }
+        });
       }
       try {
         addTeamLeaderNoteRepo(item).catch(() => {});
@@ -710,7 +928,15 @@ async function startServer() {
       serverTeamLeaderNotes.set(id, updated);
 
       if (isServerSupabaseConfigured) {
-        safeSupabaseAction(() => supabaseServer.from("teamLeaderNotes").update(item).eq("id", id));
+        safeSupabaseAction(async () => {
+          const supaPayload = toSupaTeamLeaderNote(updated);
+          const { error } = await supabaseServer.from("team_leader_notes").upsert(supaPayload);
+          if (error) {
+            try {
+              await supabaseServer.from("teamLeaderNotes").upsert(supaPayload);
+            } catch {}
+          }
+        });
       }
       try {
         updateTeamLeaderNoteRepo(id, item).catch(() => {});
@@ -729,7 +955,12 @@ async function startServer() {
     try {
       serverTeamLeaderNotes.delete(id);
       if (isServerSupabaseConfigured) {
-        safeSupabaseAction(() => supabaseServer.from("teamLeaderNotes").delete().eq("id", id));
+        safeSupabaseAction(async () => {
+          await supabaseServer.from("team_leader_notes").delete().eq("id", id);
+          try {
+            await supabaseServer.from("teamLeaderNotes").delete().eq("id", id);
+          } catch {}
+        });
       }
       try {
         deleteTeamLeaderNoteRepo(id).catch(() => {});
@@ -747,7 +978,12 @@ async function startServer() {
     try {
       serverTeamLeaderNotes.clear();
       if (isServerSupabaseConfigured) {
-        safeSupabaseAction(() => supabaseServer.from("teamLeaderNotes").delete().neq("id", ""));
+        safeSupabaseAction(async () => {
+          await supabaseServer.from("team_leader_notes").delete().neq("id", "");
+          try {
+            await supabaseServer.from("teamLeaderNotes").delete().neq("id", "");
+          } catch {}
+        });
       }
       try {
         clearTeamLeaderNotesRepo().catch(() => {});

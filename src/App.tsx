@@ -750,7 +750,153 @@ export default function App() {
                   <button
                     id="copy-supabase-rls-sql-btn"
                     onClick={() => {
-                      const sql = `-- 1. Grant public schema permissions to anon and authenticated users\nGRANT USAGE ON SCHEMA public TO anon, authenticated;\nGRANT ALL ON ALL TABLES IN SCHEMA public TO anon, authenticated;\nGRANT ALL ON ALL SEQUENCES IN SCHEMA public TO anon, authenticated;\n\n-- 2. Add full access policies (works whether RLS is ON or OFF)\nDO $$\nBEGIN\n  -- interruptions\n  ALTER TABLE IF EXISTS interruptions ENABLE ROW LEVEL SECURITY;\n  DROP POLICY IF EXISTS "Public access interruptions" ON interruptions;\n  CREATE POLICY "Public access interruptions" ON interruptions FOR ALL TO anon, authenticated USING (true) WITH CHECK (true);\n\n  -- notifications\n  ALTER TABLE IF EXISTS notifications ENABLE ROW LEVEL SECURITY;\n  DROP POLICY IF EXISTS "Public access notifications" ON notifications;\n  CREATE POLICY "Public access notifications" ON notifications FOR ALL TO anon, authenticated USING (true) WITH CHECK (true);\n\n  -- teamLeaders\n  ALTER TABLE IF EXISTS "teamLeaders" ENABLE ROW LEVEL SECURITY;\n  DROP POLICY IF EXISTS "Public access teamLeaders" ON "teamLeaders";\n  CREATE POLICY "Public access teamLeaders" ON "teamLeaders" FOR ALL TO anon, authenticated USING (true) WITH CHECK (true);\n\n  -- teamLeaderNotes\n  ALTER TABLE IF EXISTS "teamLeaderNotes" ENABLE ROW LEVEL SECURITY;\n  DROP POLICY IF EXISTS "Public access teamLeaderNotes" ON "teamLeaderNotes";\n  CREATE POLICY "Public access teamLeaderNotes" ON "teamLeaderNotes" FOR ALL TO anon, authenticated USING (true) WITH CHECK (true);\nEND $$;\n\n-- 3. Also disable RLS completely as double protection\nALTER TABLE IF EXISTS interruptions DISABLE ROW LEVEL SECURITY;\nALTER TABLE IF EXISTS notifications DISABLE ROW LEVEL SECURITY;\nALTER TABLE IF EXISTS "teamLeaders" DISABLE ROW LEVEL SECURITY;\nALTER TABLE IF EXISTS "teamLeaderNotes" DISABLE ROW LEVEL SECURITY;`;
+                      const sql = `-- ==========================================
+-- COMPLETE EEU REALTIME & TABLE SETUP SCRIPT
+-- Copy and run this in your Supabase SQL Editor
+-- ==========================================
+
+-- 1. Create tables if they do not exist
+CREATE TABLE IF NOT EXISTS public.interruptions (
+  id TEXT PRIMARY KEY,
+  feeder_name TEXT,
+  district TEXT,
+  direction TEXT,
+  type TEXT,
+  status TEXT,
+  start_time TEXT,
+  estimated_restoration_time TEXT,
+  affected_area TEXT,
+  remark TEXT,
+  last_updated TEXT
+);
+
+CREATE TABLE IF NOT EXISTS public.notifications (
+  id TEXT PRIMARY KEY,
+  feeder_id TEXT,
+  type TEXT,
+  title TEXT,
+  message TEXT,
+  timestamp TEXT,
+  read BOOLEAN DEFAULT false
+);
+
+CREATE TABLE IF NOT EXISTS public.team_leaders (
+  id TEXT PRIMARY KEY,
+  username TEXT,
+  password TEXT,
+  name TEXT,
+  district TEXT,
+  role TEXT,
+  must_change_password BOOLEAN DEFAULT false,
+  created_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS public.team_leader_notes (
+  id TEXT PRIMARY KEY,
+  content TEXT,
+  author TEXT,
+  timestamp TEXT,
+  is_urgent BOOLEAN DEFAULT false
+);
+
+CREATE TABLE IF NOT EXISTS public.preset_feeders (
+  id TEXT PRIMARY KEY,
+  feeder_str TEXT
+);
+
+CREATE TABLE IF NOT EXISTS public.hub_records (
+  no INTEGER PRIMARY KEY,
+  region TEXT,
+  csc TEXT,
+  address TEXT,
+  dummy_bp TEXT,
+  rsg TEXT,
+  dispatcher_name TEXT,
+  dispatcher_id TEXT,
+  customer_service_tl_id TEXT,
+  office_location TEXT
+);
+
+CREATE TABLE IF NOT EXISTS public.customer_contacts (
+  id TEXT PRIMARY KEY,
+  name TEXT,
+  phone TEXT,
+  category TEXT,
+  location_info TEXT,
+  hotline_short_code TEXT
+);
+
+CREATE TABLE IF NOT EXISTS public.feedbacks (
+  id TEXT PRIMARY KEY,
+  rating INTEGER,
+  category TEXT,
+  feedback_text TEXT,
+  submitted_by TEXT,
+  target_email TEXT,
+  timestamp TEXT
+);
+
+-- 2. Grant public schema permissions to anon and authenticated users
+GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role;
+GRANT ALL ON ALL TABLES IN SCHEMA public TO anon, authenticated, service_role;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO anon, authenticated, service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO anon, authenticated, service_role;
+
+-- 3. Disable Row Level Security (RLS) for instant multi-user sharing
+ALTER TABLE public.interruptions DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.notifications DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.team_leaders DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.team_leader_notes DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.preset_feeders DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.hub_records DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.customer_contacts DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.feedbacks DISABLE ROW LEVEL SECURITY;
+
+-- 4. Enable Supabase Realtime Broadcast on all tables
+ALTER TABLE public.interruptions REPLICA IDENTITY FULL;
+ALTER TABLE public.notifications REPLICA IDENTITY FULL;
+ALTER TABLE public.team_leaders REPLICA IDENTITY FULL;
+ALTER TABLE public.team_leader_notes REPLICA IDENTITY FULL;
+ALTER TABLE public.preset_feeders REPLICA IDENTITY FULL;
+ALTER TABLE public.hub_records REPLICA IDENTITY FULL;
+ALTER TABLE public.customer_contacts REPLICA IDENTITY FULL;
+ALTER TABLE public.feedbacks REPLICA IDENTITY FULL;
+
+DO $$
+BEGIN
+  BEGIN
+    ALTER PUBLICATION supabase_realtime ADD TABLE public.interruptions;
+  EXCEPTION WHEN OTHERS THEN NULL;
+  END;
+  BEGIN
+    ALTER PUBLICATION supabase_realtime ADD TABLE public.notifications;
+  EXCEPTION WHEN OTHERS THEN NULL;
+  END;
+  BEGIN
+    ALTER PUBLICATION supabase_realtime ADD TABLE public.team_leaders;
+  EXCEPTION WHEN OTHERS THEN NULL;
+  END;
+  BEGIN
+    ALTER PUBLICATION supabase_realtime ADD TABLE public.team_leader_notes;
+  EXCEPTION WHEN OTHERS THEN NULL;
+  END;
+  BEGIN
+    ALTER PUBLICATION supabase_realtime ADD TABLE public.preset_feeders;
+  EXCEPTION WHEN OTHERS THEN NULL;
+  END;
+  BEGIN
+    ALTER PUBLICATION supabase_realtime ADD TABLE public.hub_records;
+  EXCEPTION WHEN OTHERS THEN NULL;
+  END;
+  BEGIN
+    ALTER PUBLICATION supabase_realtime ADD TABLE public.customer_contacts;
+  EXCEPTION WHEN OTHERS THEN NULL;
+  END;
+  BEGIN
+    ALTER PUBLICATION supabase_realtime ADD TABLE public.feedbacks;
+  EXCEPTION WHEN OTHERS THEN NULL;
+  END;
+END $$;`;
                       navigator.clipboard.writeText(sql);
                       setCopiedRlsSql(true);
                       setTimeout(() => setCopiedRlsSql(false), 3000);
