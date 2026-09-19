@@ -257,6 +257,9 @@ export async function seedInitialDataIfEmpty() {
   }
 }
 
+let detectedTeamLeadersTable: 'teamLeaders' | 'team_leaders' | null = null;
+let detectedNotesTable: 'teamLeaderNotes' | 'team_leader_notes' | null = null;
+
 // Normalizers for Supabase records (handles both camelCase and snake_case)
 function normalizeInterruption(row: any): FeederInterruption {
   return {
@@ -309,6 +312,151 @@ function normalizeTeamLeader(row: any): TeamLeaderUser {
   };
 }
 
+// Resilient upsert for interruptions supporting both snake_case and camelCase Supabase schemas
+async function resilientUpsertInterruption(record: FeederInterruption) {
+  if (!supabase) return;
+
+  const snakePayload: Record<string, any> = {
+    id: record.id,
+    feeder_name: record.feederName,
+    district: record.district,
+    direction: record.direction,
+    type: record.type,
+    status: record.status,
+    start_time: record.startTime,
+    estimated_restoration_time: record.estimatedRestorationTime,
+    affected_area: record.affectedArea,
+    remark: record.remark,
+    last_updated: record.lastUpdated
+  };
+
+  const camelPayload: Record<string, any> = {
+    id: record.id,
+    feederName: record.feederName,
+    district: record.district,
+    direction: record.direction,
+    type: record.type,
+    status: record.status,
+    startTime: record.startTime,
+    estimatedRestorationTime: record.estimatedRestorationTime,
+    affectedArea: record.affectedArea,
+    remark: record.remark,
+    lastUpdated: record.lastUpdated
+  };
+
+  try {
+    // 1. Try snake_case
+    const { error: snakeErr } = await supabase.from('interruptions').upsert(snakePayload);
+    if (!snakeErr) return;
+
+    notifyIfRlsError('interruptions', snakeErr);
+
+    // 2. Try camelCase
+    const { error: camelErr } = await supabase.from('interruptions').upsert(camelPayload);
+    if (!camelErr) return;
+
+    // 3. Try without direction in case column doesn't exist yet
+    delete snakePayload.direction;
+    delete camelPayload.direction;
+    const { error: s2 } = await supabase.from('interruptions').upsert(snakePayload);
+    if (!s2) return;
+    await supabase.from('interruptions').upsert(camelPayload);
+  } catch (err) {
+    console.warn('[Supabase Interruption Upsert Exception]', err);
+  }
+}
+
+async function resilientUpdateInterruption(id: string, entry: Partial<FeederInterruption>, timestampStr: string) {
+  if (!supabase) return;
+
+  const snakeUpdate: Record<string, any> = { last_updated: timestampStr };
+  const camelUpdate: Record<string, any> = { lastUpdated: timestampStr };
+
+  if (entry.feederName !== undefined) {
+    snakeUpdate.feeder_name = entry.feederName;
+    camelUpdate.feederName = entry.feederName;
+  }
+  if (entry.district !== undefined) {
+    snakeUpdate.district = entry.district;
+    camelUpdate.district = entry.district;
+  }
+  if (entry.direction !== undefined) {
+    snakeUpdate.direction = entry.direction;
+    camelUpdate.direction = entry.direction;
+  }
+  if (entry.type !== undefined) {
+    snakeUpdate.type = entry.type;
+    camelUpdate.type = entry.type;
+  }
+  if (entry.status !== undefined) {
+    snakeUpdate.status = entry.status;
+    camelUpdate.status = entry.status;
+  }
+  if (entry.startTime !== undefined) {
+    snakeUpdate.start_time = entry.startTime;
+    camelUpdate.startTime = entry.startTime;
+  }
+  if (entry.estimatedRestorationTime !== undefined) {
+    snakeUpdate.estimated_restoration_time = entry.estimatedRestorationTime;
+    camelUpdate.estimatedRestorationTime = entry.estimatedRestorationTime;
+  }
+  if (entry.affectedArea !== undefined) {
+    snakeUpdate.affected_area = entry.affectedArea;
+    camelUpdate.affectedArea = entry.affectedArea;
+  }
+  if (entry.remark !== undefined) {
+    snakeUpdate.remark = entry.remark;
+    camelUpdate.remark = entry.remark;
+  }
+
+  try {
+    const { error: snakeErr } = await supabase.from('interruptions').update(snakeUpdate).eq('id', id);
+    if (!snakeErr) return;
+
+    notifyIfRlsError('interruptions', snakeErr);
+
+    const { error: camelErr } = await supabase.from('interruptions').update(camelUpdate).eq('id', id);
+    if (!camelErr) return;
+
+    // Retry without direction
+    delete snakeUpdate.direction;
+    delete camelUpdate.direction;
+    const { error: s2 } = await supabase.from('interruptions').update(snakeUpdate).eq('id', id);
+    if (!s2) return;
+    await supabase.from('interruptions').update(camelUpdate).eq('id', id);
+  } catch (err) {
+    console.warn('[Supabase Interruption Update Exception]', err);
+  }
+}
+
+async function resilientUpsertNotification(noti: SystemNotification) {
+  if (!supabase) return;
+  try {
+    const snakePayload = {
+      id: noti.id,
+      feeder_id: noti.feederId,
+      type: noti.type,
+      title: noti.title,
+      message: noti.message,
+      timestamp: noti.timestamp,
+      read: noti.read
+    };
+    const { error } = await supabase.from('notifications').upsert(snakePayload);
+    if (error) {
+      const camelPayload = {
+        id: noti.id,
+        feederId: noti.feederId,
+        type: noti.type,
+        title: noti.title,
+        message: noti.message,
+        timestamp: noti.timestamp,
+        read: noti.read
+      };
+      await supabase.from('notifications').upsert(camelPayload);
+    }
+  } catch {}
+}
+
 // ==========================================
 // 1. FEEDER INTERRUPTIONS
 // ==========================================
@@ -329,7 +477,7 @@ export async function fetchInterruptions(): Promise<FeederInterruption[]> {
   if (supabase) {
     try {
       const { data, error } = await supabase.from('interruptions').select('*');
-      if (!error && Array.isArray(data) && data.length > 0) {
+      if (!error && Array.isArray(data)) {
         const normalized = data.map(normalizeInterruption);
         setLocal('eeu-interruptions', normalized);
         return normalized;
@@ -416,7 +564,7 @@ export function subscribeToInterruptions(onUpdate: (items: FeederInterruption[])
     window.addEventListener('focus', doFetch);
   }
 
-  const interval = setInterval(doFetch, 5000);
+  const interval = setInterval(doFetch, 3000);
 
   return () => {
     syncListeners.interruptions.delete(onSync);
@@ -479,33 +627,9 @@ export async function addInterruptionDoc(entry: Omit<FeederInterruption, 'id' | 
     }).catch(() => {});
   }
 
-  if (supabase) {
-    safeSupa(() => supabase.from('interruptions').upsert({
-      id: record.id,
-      feeder_name: record.feederName,
-      district: record.district,
-      direction: record.direction,
-      type: record.type,
-      status: record.status,
-      start_time: record.startTime,
-      estimated_restoration_time: record.estimatedRestorationTime,
-      affected_area: record.affectedArea,
-      remark: record.remark,
-      last_updated: record.lastUpdated
-    })).then((res: any) => {
-      if (res?.error) notifyIfRlsError('interruptions', res.error);
-    });
-
-    safeSupa(() => supabase.from('notifications').upsert({
-      id: newNoti.id,
-      feeder_id: newNoti.feederId,
-      type: newNoti.type,
-      title: newNoti.title,
-      message: newNoti.message,
-      timestamp: newNoti.timestamp,
-      read: newNoti.read
-    }));
-  }
+  // Direct Supabase resilient write
+  resilientUpsertInterruption(record);
+  resilientUpsertNotification(newNoti);
 
   broadcastGlobalSync('interruptions');
   broadcastGlobalSync('notifications');
@@ -573,34 +697,12 @@ export async function updateInterruptionDoc(id: string, entry: Partial<FeederInt
     }
   }
 
-  if (supabase) {
-    const supaUpdate: any = { last_updated: timestampStr };
-    if (entry.status !== undefined) supaUpdate.status = entry.status;
-    if (entry.remark !== undefined) supaUpdate.remark = entry.remark;
-    if (entry.estimatedRestorationTime !== undefined) supaUpdate.estimated_restoration_time = entry.estimatedRestorationTime;
-    if (entry.feederName !== undefined) supaUpdate.feeder_name = entry.feederName;
-    if (entry.district !== undefined) supaUpdate.district = entry.district;
-    if (entry.type !== undefined) supaUpdate.type = entry.type;
-    if (entry.startTime !== undefined) supaUpdate.start_time = entry.startTime;
-    if (entry.affectedArea !== undefined) supaUpdate.affected_area = entry.affectedArea;
-    if (entry.direction !== undefined) supaUpdate.direction = entry.direction;
+  // Direct Supabase resilient update
+  resilientUpdateInterruption(id, entry, timestampStr);
 
-    safeSupa(() => supabase.from('interruptions').update(supaUpdate).eq('id', id)).then((res: any) => {
-      if (res?.error) notifyIfRlsError('interruptions', res.error);
-    });
-
-    if (changeNoti) {
-      safeSupa(() => supabase.from('notifications').upsert({
-        id: changeNoti!.id,
-        feeder_id: changeNoti!.feederId,
-        type: changeNoti!.type,
-        title: changeNoti!.title,
-        message: changeNoti!.message,
-        timestamp: changeNoti!.timestamp,
-        read: changeNoti!.read
-      }));
-      broadcastGlobalSync('notifications');
-    }
+  if (changeNoti) {
+    resilientUpsertNotification(changeNoti);
+    broadcastGlobalSync('notifications');
   }
 
   broadcastGlobalSync('interruptions');
@@ -1004,9 +1106,12 @@ export async function fetchTeamLeaderNotes(): Promise<TeamLeaderNote[]> {
 
   if (supabase) {
     try {
-      const { data, error } = await supabase.from('team_leader_notes').select('*');
-      if (!error && Array.isArray(data)) {
-        const normalized = data.map(normalizeTeamLeaderNote);
+      let res = await supabase.from('teamLeaderNotes').select('*');
+      if (res.error) {
+        res = await supabase.from('team_leader_notes').select('*');
+      }
+      if (!res.error && Array.isArray(res.data)) {
+        const normalized = res.data.map(normalizeTeamLeaderNote);
         setLocal('eeu-team-leader-notes', normalized);
         return normalized;
       }
@@ -1037,7 +1142,7 @@ export function subscribeToTeamLeaderNotes(onUpdate: (items: TeamLeaderNote[]) =
   };
   syncListeners.teamLeaderNotes.add(onSync);
 
-  const interval = setInterval(doFetch, 5000);
+  const interval = setInterval(doFetch, 4000);
 
   return () => {
     syncListeners.teamLeaderNotes.delete(onSync);
@@ -1060,14 +1165,28 @@ export async function addTeamLeaderNoteDoc(content: string, author: string, isUr
       method: 'POST',
       body: JSON.stringify(record)
     }).catch(() => {});
-  } else if (supabase) {
-    safeSupa(() => supabase.from('team_leader_notes').upsert({
-      id: record.id,
-      content: record.content,
-      author: record.author,
-      timestamp: record.timestamp,
-      is_urgent: record.isUrgent
-    }));
+  }
+  if (supabase) {
+    safeSupa(async () => {
+      const { error } = await supabase.from('teamLeaderNotes').upsert({
+        id: record.id,
+        content: record.content,
+        author: record.author,
+        timestamp: record.timestamp,
+        isUrgent: record.isUrgent
+      });
+      if (error) {
+        try {
+          await supabase.from('team_leader_notes').upsert({
+            id: record.id,
+            content: record.content,
+            author: record.author,
+            timestamp: record.timestamp,
+            is_urgent: record.isUrgent
+          });
+        } catch {}
+      }
+    });
   }
 
   broadcastGlobalSync('teamLeaderNotes');
@@ -1086,12 +1205,24 @@ export async function updateTeamLeaderNoteDoc(id: string, content: string, isUrg
       method: 'PUT',
       body: JSON.stringify({ content, isUrgent, timestamp: timestampStr })
     }).catch(() => {});
-  } else if (supabase) {
-    safeSupa(() => supabase.from('team_leader_notes').update({
-      content,
-      is_urgent: isUrgent,
-      timestamp: timestampStr
-    }).eq('id', id));
+  }
+  if (supabase) {
+    safeSupa(async () => {
+      const { error } = await supabase.from('teamLeaderNotes').update({
+        content,
+        isUrgent: isUrgent,
+        timestamp: timestampStr
+      }).eq('id', id);
+      if (error) {
+        try {
+          await supabase.from('team_leader_notes').update({
+            content,
+            is_urgent: isUrgent,
+            timestamp: timestampStr
+          }).eq('id', id);
+        } catch {}
+      }
+    });
   }
 
   broadcastGlobalSync('teamLeaderNotes');
@@ -1103,8 +1234,14 @@ export async function deleteTeamLeaderNoteDoc(id: string) {
 
   if (serverProxyAvailable) {
     apiFetch(`/api/teamLeaderNotes/${id}`, { method: 'DELETE' }).catch(() => {});
-  } else if (supabase) {
-    safeSupa(() => supabase.from('team_leader_notes').delete().eq('id', id));
+  }
+  if (supabase) {
+    safeSupa(async () => {
+      await supabase.from('teamLeaderNotes').delete().eq('id', id);
+      try {
+        await supabase.from('team_leader_notes').delete().eq('id', id);
+      } catch {}
+    });
   }
 
   broadcastGlobalSync('teamLeaderNotes');
@@ -1115,8 +1252,14 @@ export async function clearTeamLeaderNotes() {
 
   if (serverProxyAvailable) {
     apiFetch('/api/teamLeaderNotes', { method: 'DELETE' }).catch(() => {});
-  } else if (supabase) {
-    safeSupa(() => supabase.from('team_leader_notes').delete().neq('id', ''));
+  }
+  if (supabase) {
+    safeSupa(async () => {
+      await supabase.from('teamLeaderNotes').delete().neq('id', '');
+      try {
+        await supabase.from('team_leader_notes').delete().neq('id', '');
+      } catch {}
+    });
   }
 
   broadcastGlobalSync('teamLeaderNotes');
@@ -1287,9 +1430,9 @@ export async function fetchTeamLeaders(): Promise<TeamLeaderUser[]> {
 
   if (supabase) {
     try {
-      let res = await supabase.from('team_leaders').select('*');
+      let res = await supabase.from('teamLeaders').select('*');
       if (res.error) {
-        res = await supabase.from('teamLeaders').select('*');
+        res = await supabase.from('team_leaders').select('*');
       }
       if (!res.error && Array.isArray(res.data) && res.data.length > 0) {
         const normalized = res.data.map(normalizeTeamLeader);
@@ -1332,7 +1475,7 @@ export function subscribeToTeamLeaders(onUpdate: (items: TeamLeaderUser[]) => vo
   };
   syncListeners.teamLeaders.add(onSync);
 
-  const interval = setInterval(doFetch, 5000);
+  const interval = setInterval(doFetch, 4000);
 
   return () => {
     syncListeners.teamLeaders.delete(onSync);
@@ -1365,27 +1508,27 @@ export async function addTeamLeaderDoc(item: Omit<TeamLeaderUser, 'id' | 'create
   }
   if (supabase) {
     safeSupa(async () => {
-      const { error } = await supabase.from('team_leaders').upsert({
+      const { error } = await supabase.from('teamLeaders').upsert({
         id: record.id,
         username: record.username,
         password: record.password,
         name: record.name,
         district: record.district,
         role: record.role,
-        must_change_password: record.mustChangePassword,
-        created_at: record.createdAt
+        mustChangePassword: record.mustChangePassword,
+        createdAt: record.createdAt
       });
       if (error) {
         try {
-          await supabase.from('teamLeaders').upsert({
+          await supabase.from('team_leaders').upsert({
             id: record.id,
             username: record.username,
             password: record.password,
             name: record.name,
             district: record.district,
             role: record.role,
-            mustChangePassword: record.mustChangePassword,
-            createdAt: record.createdAt
+            must_change_password: record.mustChangePassword,
+            created_at: record.createdAt
           });
         } catch {}
       }
@@ -1420,27 +1563,27 @@ export async function updateTeamLeaderDoc(item: TeamLeaderUser) {
   }
   if (supabase) {
     safeSupa(async () => {
-      const { error } = await supabase.from('team_leaders').upsert({
+      const { error } = await supabase.from('teamLeaders').upsert({
         id: record.id,
         username: record.username,
         password: record.password,
         name: record.name,
         district: record.district,
         role: record.role,
-        must_change_password: record.mustChangePassword,
-        created_at: record.createdAt
+        mustChangePassword: record.mustChangePassword,
+        createdAt: record.createdAt
       });
       if (error) {
         try {
-          await supabase.from('teamLeaders').upsert({
+          await supabase.from('team_leaders').upsert({
             id: record.id,
             username: record.username,
             password: record.password,
             name: record.name,
             district: record.district,
             role: record.role,
-            mustChangePassword: record.mustChangePassword,
-            createdAt: record.createdAt
+            must_change_password: record.mustChangePassword,
+            created_at: record.createdAt
           });
         } catch {}
       }
@@ -1460,10 +1603,12 @@ export async function deleteTeamLeaderDoc(id: string) {
   }
   if (supabase) {
     safeSupa(async () => {
-      await supabase.from('team_leaders').delete().eq('id', id);
-      try {
-        await supabase.from('teamLeaders').delete().eq('id', id);
-      } catch {}
+      const { error } = await supabase.from('teamLeaders').delete().eq('id', id);
+      if (error) {
+        try {
+          await supabase.from('team_leaders').delete().eq('id', id);
+        } catch {}
+      }
     });
   }
 
