@@ -53,6 +53,19 @@ export function broadcastSse(topic: string, data?: any) {
   }
 }
 
+// Track tables missing from remote Supabase schema cache
+const missingSupabaseTables = new Set<string>();
+
+function handleSupabaseTableError(tableName: string, error: any) {
+  if (!error) return;
+  const msg = (error.message || '').toLowerCase();
+  if (error.code === 'PGRST205' || msg.includes('could not find the table') || msg.includes('schema cache')) {
+    if (!missingSupabaseTables.has(tableName)) {
+      missingSupabaseTables.add(tableName);
+    }
+  }
+}
+
 // Setup Supabase Realtime listener on the server to bridge updates to SSE clients
 if (isServerSupabaseConfigured) {
   try {
@@ -70,11 +83,9 @@ if (isServerSupabaseConfigured) {
       .on("postgres_changes", { event: "*", schema: "public", table: "teamLeaderNotes" }, (payload) => {
         broadcastSse("teamLeaderNotes", payload);
       })
-      .subscribe((status) => {
-        console.log("[Server Supabase Realtime Bridge Status]:", status);
-      });
+      .subscribe();
   } catch (err) {
-    console.warn("Could not attach server Supabase Realtime channel:", err);
+    // Ignore realtime attach issues
   }
 }
 
@@ -147,7 +158,7 @@ async function startServer() {
   // === 1. Interruptions (Server-side Supabase Proxy with Cloud SQL fallback) ===
   app.get("/api/interruptions", async (req, res) => {
     try {
-      if (isServerSupabaseConfigured && !global.isSupabaseInterruptionsTableMissing) {
+      if (isServerSupabaseConfigured && !missingSupabaseTables.has("interruptions")) {
         const { data, error } = await supabaseServer
           .from("interruptions")
           .select("*")
@@ -157,10 +168,7 @@ async function startServer() {
           return res.json(data);
         }
         if (error) {
-          console.warn("[Server Supabase interruptions error]:", error.message);
-          if (error.code === 'PGRST205') {
-            global.isSupabaseInterruptionsTableMissing = true;
-          }
+          handleSupabaseTableError("interruptions", error);
         }
       }
 
@@ -188,7 +196,7 @@ async function startServer() {
       let savedRecord = item;
 
       // 1. Write to Supabase if configured
-      if (isServerSupabaseConfigured) {
+      if (isServerSupabaseConfigured && !missingSupabaseTables.has("interruptions")) {
         let { data, error } = await supabaseServer.from("interruptions").insert(item).select().single();
         if (error && error.message && error.message.toLowerCase().includes("direction")) {
           const { direction, ...compatRecord } = item;
@@ -197,7 +205,7 @@ async function startServer() {
           if (retry.data) data = retry.data;
         }
         if (error) {
-          console.warn("[Server Supabase interruption insert error]:", error.message);
+          handleSupabaseTableError("interruptions", error);
         } else if (data) {
           savedRecord = data;
         }
@@ -207,7 +215,7 @@ async function startServer() {
       try {
         await addInterruptionRepo(savedRecord);
       } catch (sqlErr) {
-        console.warn("Cloud SQL interruption sync note:", sqlErr);
+        // Cloud SQL sync
       }
 
       // 3. Broadcast real-time update to all connected browser SSE clients
@@ -226,7 +234,7 @@ async function startServer() {
     try {
       let updatedRecord = { id, ...updatePayload };
 
-      if (isServerSupabaseConfigured) {
+      if (isServerSupabaseConfigured && !missingSupabaseTables.has("interruptions")) {
         let { data, error } = await supabaseServer
           .from("interruptions")
           .update(updatePayload)
@@ -247,7 +255,7 @@ async function startServer() {
         }
 
         if (error) {
-          console.warn("[Server Supabase interruption update error]:", error.message);
+          handleSupabaseTableError("interruptions", error);
         } else if (data) {
           updatedRecord = data;
         }
@@ -257,7 +265,7 @@ async function startServer() {
         const repoUpd = await updateInterruptionRepo(id, updatePayload);
         if (repoUpd && !isServerSupabaseConfigured) updatedRecord = repoUpd;
       } catch (sqlErr) {
-        console.warn("Cloud SQL interruption update sync note:", sqlErr);
+        // Cloud SQL sync
       }
 
       broadcastSse("interruptions", updatedRecord);
@@ -271,17 +279,17 @@ async function startServer() {
   app.delete("/api/interruptions/:id", async (req, res) => {
     const id = req.params.id;
     try {
-      if (isServerSupabaseConfigured) {
+      if (isServerSupabaseConfigured && !missingSupabaseTables.has("interruptions")) {
         const { error } = await supabaseServer.from("interruptions").delete().eq("id", id);
         if (error) {
-          console.warn("[Server Supabase interruption delete error]:", error.message);
+          handleSupabaseTableError("interruptions", error);
         }
       }
 
       try {
         await deleteInterruptionRepo(id);
       } catch (sqlErr) {
-        console.warn("Cloud SQL interruption delete sync note:", sqlErr);
+        // Cloud SQL sync
       }
 
       broadcastSse("interruptions", { id, deleted: true });
